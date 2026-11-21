@@ -119,6 +119,9 @@ fn prefix_xor(mut x: u128) -> u128 {
 pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut [&'a [u8]; N]) -> bool {
     let len = line.len();
     debug_assert!(len < 128);
+    if len < 64 {
+        return fields64::<N>(line, cm as u64, qm as u64, out);
+    }
     let lm = (1u128 << len) - 1;
     let c = cm & lm;
     if c.count_ones() as usize != N - 1 {
@@ -146,6 +149,53 @@ pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut 
             len
         };
         // a valid quoted field starts with '"' (and then also ends with one)
+        let qd = (q != 0 && s < e && unsafe { *line.get_unchecked(s) } == b'"') as usize;
+        out[k] = unsafe { line.get_unchecked(s + qd..e - qd) };
+        s = e + 1;
+    }
+    true
+}
+
+#[inline(always)]
+fn prefix_xor64(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// `fields` for lines shorter than 64 bytes, on 64-bit masks.
+#[inline(always)]
+fn fields64<'a, const N: usize>(line: &'a [u8], cm: u64, qm: u64, out: &mut [&'a [u8]; N]) -> bool {
+    let len = line.len();
+    let lm = (1u64 << len) - 1;
+    let c = cm & lm;
+    if c.count_ones() as usize != N - 1 {
+        return false;
+    }
+    let q = qm & lm;
+    if q != 0 {
+        let seps = c | (1u64 << len);
+        let starts = (c << 1) | 1;
+        let ends = seps >> 1;
+        let bad = (q & !(starts | ends)) | (q & starts & ends) | (prefix_xor64(q) & seps);
+        if bad != 0 {
+            return false;
+        }
+    }
+    let mut x = c;
+    let mut s = 0usize;
+    for k in 0..N {
+        let e = if k + 1 < N {
+            let e = x.trailing_zeros() as usize;
+            x &= x - 1;
+            e
+        } else {
+            len
+        };
         let qd = (q != 0 && s < e && unsafe { *line.get_unchecked(s) } == b'"') as usize;
         out[k] = unsafe { line.get_unchecked(s + qd..e - qd) };
         s = e + 1;
