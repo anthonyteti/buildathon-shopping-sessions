@@ -122,13 +122,18 @@ pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut 
     if len < 64 {
         return fields64::<N>(line, cm as u64, qm as u64, out);
     }
-    let lm = (1u128 << len) - 1;
-    let c = cm & lm;
-    if c.count_ones() as usize != N - 1 {
+    // 64 <= len < 128: work on the two 64-bit halves
+    let mh = (1u64 << (len - 64)) - 1;
+    let clo = cm as u64;
+    let chi = (cm >> 64) as u64 & mh;
+    if (clo.count_ones() + chi.count_ones()) as usize != N - 1 {
         return false;
     }
-    let q = qm & lm;
-    if q != 0 {
+    let qlo = qm as u64;
+    let qhi = (qm >> 64) as u64 & mh;
+    if (qlo | qhi) != 0 {
+        let c = clo as u128 | (chi as u128) << 64;
+        let q = qlo as u128 | (qhi as u128) << 64;
         let seps = c | (1u128 << len);
         let starts = (c << 1) | 1;
         let ends = seps >> 1;
@@ -137,8 +142,9 @@ pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut 
             return false;
         }
     }
-    let mut x = c;
+    let mut x = clo as u128 | (chi as u128) << 64;
     let mut s = 0usize;
+    let base = line.as_ptr();
     for k in 0..N {
         let e = if k + 1 < N {
             let lo = x as u64;
@@ -148,9 +154,9 @@ pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut 
         } else {
             len
         };
-        // a valid quoted field starts with '"' (and then also ends with one)
-        let qd = (q != 0 && s < e && unsafe { *line.get_unchecked(s) } == b'"') as usize;
-        out[k] = unsafe { line.get_unchecked(s + qd..e - qd) };
+        // a quote at a field start means a validated quoted field (line[len] is '\n')
+        let qd = (unsafe { *base.add(s) } == b'"') as usize;
+        out[k] = unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) };
         s = e + 1;
     }
     true
@@ -196,8 +202,8 @@ fn fields64<'a, const N: usize>(line: &'a [u8], cm: u64, qm: u64, out: &mut [&'a
         } else {
             len
         };
-        let qd = (q != 0 && s < e && unsafe { *line.get_unchecked(s) } == b'"') as usize;
-        out[k] = unsafe { line.get_unchecked(s + qd..e - qd) };
+        let qd = (unsafe { *line.as_ptr().add(s) } == b'"') as usize;
+        out[k] = unsafe { std::slice::from_raw_parts(line.as_ptr().add(s + qd), e - s - 2 * qd) };
         s = e + 1;
     }
     true

@@ -1,66 +1,78 @@
 //! Fast decoders with exact fallbacks: SWAR timestamps (month table around the window)
 //! and direct-index lookups for product and campaign IDs of the form `<prefix><n>`.
-use crate::{DAY, FxMap, civil_ms, days_from_civil, parse_ts};
+use crate::{DAY, FxMap, civil_ms, parse_ts};
 
 pub struct TsTab {
-    prefix: Vec<u64>,        // "YYYY-MM-" of each month, little-endian
-    months: Vec<(i64, i64)>, // (days since epoch of the 1st, days in month)
+    // "YYYY-MM-DD" of every date near the window, in a 256-slot table with one slot per
+    // date (the multiplier is chosen so no two of these dates share a slot)
+    slots: Vec<(u64, u16, i64)>, // (bytes 0..8, bytes 8..10, days since epoch); empty: (0, 0, 0)
+    mult: u64,
 }
 
+const SLOT_BITS: u32 = 8;
+
 impl TsTab {
-    /// Covers every month that touches [from_ms - 3 days, to_ms + 3 days].
+    /// Covers every date in [from_ms - 10 days, to_ms + 10 days].
     pub fn new(from_ms: i64, to_ms: i64) -> TsTab {
-        let ym = |ms: i64| {
-            let (y, m, _) = civil_from_days(ms.div_euclid(DAY));
-            y * 12 + m - 1
-        };
-        let lo = ym(from_ms - 3 * DAY);
-        let hi = ym(to_ms + 3 * DAY);
-        let prefix = (lo..=hi)
-            .map(|k| {
-                let (y, m) = (k.div_euclid(12), k.rem_euclid(12) + 1);
-                let s = format!("{y:04}-{m:02}-");
-                if s.len() == 8 { u64::from_le_bytes(s.as_bytes().try_into().unwrap()) } else { 0 }
-            })
-            .collect();
-        let months = (lo..=hi)
-            .map(|k| {
-                let (y, m) = (k.div_euclid(12), k.rem_euclid(12) + 1);
-                let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-                let dim = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(m - 1) as usize];
-                (days_from_civil(y, m, 1), dim)
-            })
-            .collect();
-        TsTab { prefix, months }
+        let d0 = from_ms.div_euclid(DAY) - 10;
+        let d1 = to_ms.div_euclid(DAY) + 10;
+        let mut dates = Vec::new();
+        for d in d0..=d1 {
+            let (y, m, dd) = civil_from_days(d);
+            let s = format!("{y:04}-{m:02}-{dd:02}");
+            if s.len() == 10 {
+                let b = s.as_bytes();
+                dates.push((u64::from_le_bytes(b[0..8].try_into().unwrap()), u16::from_le_bytes([b[8], b[9]]), d));
+            }
+        }
+        let mut mult = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..10_000 {
+            let mut slots = vec![(0u64, 0u16, 0i64); 1 << SLOT_BITS];
+            let mut ok = true;
+            for &(a, dd, days) in &dates {
+                let h = Self::hash(mult, a, dd);
+                if slots[h].0 != 0 {
+                    ok = false;
+                    break;
+                }
+                slots[h] = (a, dd, days);
+            }
+            if ok {
+                return TsTab { slots, mult };
+            }
+            mult = mult.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F) | 1;
+        }
+        // no collision-free multiplier (cannot happen for a normal window): table unused
+        TsTab { slots: vec![(0, 0, 0); 1 << SLOT_BITS], mult }
+    }
+
+    #[inline(always)]
+    fn hash(mult: u64, a: u64, d: u16) -> usize {
+        ((a ^ ((d as u64) << 3)).wrapping_mul(mult) >> (64 - SLOT_BITS)) as usize
+    }
+
+    /// Days since epoch of the "YYYY-MM-DD" in f[0..10], if it is a date in the table.
+    #[inline(always)]
+    fn date(&self, f: &[u8]) -> Option<i64> {
+        let a = u64::from_le_bytes(f[0..8].try_into().unwrap());
+        let d = u16::from_le_bytes([f[8], f[9]]);
+        let e = unsafe { *self.slots.get_unchecked(Self::hash(self.mult, a, d)) };
+        if e.0 == a && e.1 == d { Some(e.2) } else { None }
     }
 
     /// YYYY-MM-DDTHH:MM:SS in f[0..19] -> epoch ms. `f` needs 19 bytes.
-    /// Months near the window are matched on their "YYYY-MM-" prefix; anything else
-    /// goes to the general `civil_ms`.
+    /// Dates near the window come from the table; anything else goes to `civil_ms`.
     #[inline(always)]
     fn civil(&self, f: &[u8]) -> Option<i64> {
         let f: &[u8; 19] = f[..19].try_into().unwrap();
-        let a = u64::from_le_bytes(f[0..8].try_into().unwrap());
-        let mut j = usize::MAX;
-        for (k, &p) in self.prefix.iter().enumerate() {
-            if a == p {
-                j = k;
-            }
-        }
-        if j == usize::MAX {
-            return civil_ms(f);
-        }
-        let d1 = f[8].wrapping_sub(b'0') as i64;
-        let d2 = f[9].wrapping_sub(b'0') as i64;
-        let day = d1 * 10 + d2;
-        let (start, dim) = self.months[j];
+        let Some(days) = self.date(f) else { return civil_ms(f) };
         // "HH:MM:SS" at bytes 11..19
         let t = u64::from_le_bytes(f[11..19].try_into().unwrap());
         const DM: u64 = 0xFFFF_00FF_FF00_FFFF;
         let digits = (t & DM & 0xF0F0_F0F0_F0F0_F0F0) == (0x3030_3030_3030_3030 & DM)
             && (t.wrapping_add(0x0606_0606_0606_0606) & DM & 0xF0F0_F0F0_F0F0_F0F0) == (0x3030_3030_3030_3030 & DM);
         let seps = (t & 0x0000_FF00_00FF_0000) == 0x0000_3A00_003A_0000;
-        if !(digits & seps & (f[10] == b'T') & (d1 <= 9) & (d2 <= 9) & (day >= 1) & (day <= dim)) {
+        if !(digits & seps & (f[10] == b'T')) {
             return None;
         }
         let v = t & 0x0F0F_0F0F_0F0F_0F0F;
@@ -69,28 +81,20 @@ impl TsTab {
         if h > 23 || mi > 59 || s > 59 {
             return None;
         }
-        Some((start + day - 1) * DAY + ((h * 60 + mi) * 60 + s) * 1000)
+        Some(days * DAY + ((h * 60 + mi) * 60 + s) * 1000)
     }
 
-    /// ingest_ts, which the rules guarantee is a valid F1 timestamp: months near the
+    /// ingest_ts, which the rules guarantee is a valid F1 timestamp: dates near the
     /// window are decoded without re-validating; anything else takes the full parse.
     #[inline(always)]
     pub fn ingest(&self, f: &[u8]) -> i64 {
         if f.len() == 20 {
-            let a = u64::from_le_bytes(f[0..8].try_into().unwrap());
-            let mut j = usize::MAX;
-            for (k, &p) in self.prefix.iter().enumerate() {
-                if a == p {
-                    j = k;
-                }
-            }
-            if j != usize::MAX {
-                let day = (f[8].wrapping_sub(b'0') as i64) * 10 + f[9].wrapping_sub(b'0') as i64;
+            if let Some(days) = self.date(f) {
                 let t = u64::from_le_bytes(f[11..19].try_into().unwrap());
                 let v = t & 0x0F0F_0F0F_0F0F_0F0F;
                 let p = v * 10 + (v >> 8);
                 let (h, mi, s) = ((p & 0xFF) as i64, ((p >> 24) & 0xFF) as i64, ((p >> 48) & 0xFF) as i64);
-                return (self.months[j].0 + day - 1) * DAY + ((h * 60 + mi) * 60 + s) * 1000;
+                return days * DAY + ((h * 60 + mi) * 60 + s) * 1000;
             }
         }
         self.parse(f).unwrap_or(i64::MAX)

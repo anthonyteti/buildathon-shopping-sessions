@@ -1529,6 +1529,30 @@ fn bench(ctx: &Ctx, mode: &str) {
                     }
                 }
             }
+            "tsin" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(ctx.tstab.parse(std::hint::black_box(f[3])).unwrap_or(0) as u64);
+                }
+            }),
+            "tsin2" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(ctx.tstab.parse(std::hint::black_box(f[2])).unwrap_or(0) as u64);
+                }
+            }),
+            "ingin" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(ctx.tstab.ingest(std::hint::black_box(f[3])) as u64);
+                }
+            }),
+            "packin" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(unsafe { p7.pack_padded(std::hint::black_box(f[1])) });
+                }
+            }),
             "calib" => {
                 if n == 0 {
                     for _ in 0..100_000_000 {
