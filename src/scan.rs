@@ -96,50 +96,59 @@ pub unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
     (n, c, q)
 }
 
+#[inline(always)]
+fn prefix_xor(mut x: u128) -> u128 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x ^= x << 64;
+    x
+}
+
 /// Splits a line of `len` < 128 bytes into N fields using the comma and quote masks of
 /// its window (bits at or past `len` are ignored). Same result as the scalar `split`.
+///
+/// Quote rule as bit math: every quote must sit on the first or last byte of a field,
+/// never on a one-byte field, and every field must hold an even number of quotes
+/// (the prefix parity of the quote mask is 0 at every separator). Together these mean
+/// each field has no quotes or exactly one pair wrapping it.
 #[inline(always)]
 pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut [&'a [u8]; N]) -> bool {
     let len = line.len();
     debug_assert!(len < 128);
     let lm = (1u128 << len) - 1;
-    let mut c = cm & lm;
+    let c = cm & lm;
     if c.count_ones() as usize != N - 1 {
         return false;
     }
-    let mut st = [0usize; N];
-    let mut en = [0usize; N];
+    let q = qm & lm;
+    if q != 0 {
+        let seps = c | (1u128 << len);
+        let starts = (c << 1) | 1;
+        let ends = seps >> 1;
+        let bad = (q & !(starts | ends)) | (q & starts & ends) | (prefix_xor(q) & seps);
+        if bad != 0 {
+            return false;
+        }
+    }
+    let mut x = c;
     let mut s = 0usize;
     for k in 0..N {
         let e = if k + 1 < N {
-            let e = c.trailing_zeros() as usize;
-            c &= c - 1;
+            let lo = x as u64;
+            let e = if lo != 0 { lo.trailing_zeros() } else { 64 + ((x >> 64) as u64).trailing_zeros() } as usize;
+            x &= x - 1;
             e
         } else {
             len
         };
-        st[k] = s;
-        en[k] = e;
+        // a valid quoted field starts with '"' (and then also ends with one)
+        let qd = (q != 0 && s < e && unsafe { *line.get_unchecked(s) } == b'"') as usize;
+        out[k] = unsafe { line.get_unchecked(s + qd..e - qd) };
         s = e + 1;
-    }
-    let q = qm & lm;
-    if q == 0 {
-        for k in 0..N {
-            out[k] = unsafe { line.get_unchecked(st[k]..en[k]) };
-        }
-        return true;
-    }
-    for k in 0..N {
-        let (s, e) = (st[k], en[k]);
-        let fm = ((1u128 << (e - s)) - 1) << s;
-        let fq = q & fm;
-        if fq == 0 {
-            out[k] = unsafe { line.get_unchecked(s..e) };
-        } else if e - s >= 2 && fq == ((1u128 << s) | (1u128 << (e - 1))) {
-            out[k] = unsafe { line.get_unchecked(s + 1..e - 1) };
-        } else {
-            return false;
-        }
     }
     true
 }

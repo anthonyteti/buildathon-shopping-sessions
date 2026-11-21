@@ -12,7 +12,6 @@ path = "src/main.rs"
 libc = "=0.2.191"
 memchr = "=2.8.3"
 memmap2 = "=0.9.12"
-parquet = { version = "=60.1.0", default-features = false }
 
 [profile.release]
 lto = "fat"

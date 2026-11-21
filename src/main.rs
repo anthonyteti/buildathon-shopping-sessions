@@ -14,6 +14,7 @@
 //! equality and byte-wise order are exact integer operations. If any ID does not fit,
 //! the whole run is redone with keys that are ranks in the sorted set of all IDs.
 
+mod fastpath;
 mod parquet_out;
 mod scan;
 
@@ -116,6 +117,11 @@ fn d2(a: u8, b: u8) -> Option<i64> {
     if x < 10 && y < 10 { Some(x as i64 * 10 + y as i64) } else { None }
 }
 
+#[cfg(test)]
+pub fn parse_ts_for_test(f: &[u8]) -> Option<i64> {
+    parse_ts(f)
+}
+
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -126,7 +132,7 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// f[0..19] = YYYY-MM-DDTHH:MM:SS -> epoch ms.
 #[inline(always)]
-fn civil_ms(f: &[u8]) -> Option<i64> {
+pub fn civil_ms(f: &[u8]) -> Option<i64> {
     if f[4] != b'-' || f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
         return None;
     }
@@ -149,7 +155,7 @@ fn civil_ms(f: &[u8]) -> Option<i64> {
 
 /// F1 / F2 / F3 -> epoch ms, or None for a bad form. F3 saturates (huge = outside any window).
 #[inline(always)]
-fn parse_ts(f: &[u8]) -> Option<i64> {
+pub fn parse_ts(f: &[u8]) -> Option<i64> {
     match f.len() {
         0 => None,
         20 if f[19] == b'Z' => civil_ms(f),
@@ -476,7 +482,18 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
+pub struct Input {
+    map: Mmap,
+    file: std::fs::File,
+}
+impl std::ops::Deref for Input {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.map
+    }
+}
+
+fn map_files(paths: &[PathBuf]) -> Vec<Input> {
     let mut out = Vec::new();
     for p in paths {
         let f = std::fs::File::open(p).expect("open csv");
@@ -485,9 +502,25 @@ fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
             continue;
         }
         let m = unsafe { Mmap::map(&f) }.expect("mmap csv");
-        out.push(m);
+        out.push(Input { map: m, file: f });
     }
     out
+}
+
+/// Runs `f(data, start, end)` over one chunk: either straight on the mapping, or (with
+/// `read`) on a copy read into `buf`, padded so every line takes the fast path.
+#[inline(always)]
+fn with_chunk(inp: &Input, c: &Chunk, read: bool, buf: &mut Vec<u8>, f: impl FnOnce(&[u8], usize, usize)) {
+    if !read {
+        f(&inp.map, c.start, c.end);
+        return;
+    }
+    use std::os::unix::fs::FileExt;
+    let len = c.end - c.start;
+    buf.clear();
+    buf.resize(len + scan::FAST_SLACK, 0);
+    inp.file.read_exact_at(&mut buf[..len], c.start as u64).expect("read csv");
+    f(&buf[..], 0, len);
 }
 
 #[derive(Clone, Copy)]
@@ -498,7 +531,7 @@ struct Chunk {
     end: usize,
 }
 
-fn make_chunks(maps: &[Mmap], kind: u8, target: usize, out: &mut Vec<Chunk>) {
+fn make_chunks(maps: &[Input], kind: u8, target: usize, out: &mut Vec<Chunk>) {
     for (fi, m) in maps.iter().enumerate() {
         let d: &[u8] = m;
         let len = d.len();
@@ -560,17 +593,23 @@ pub struct Ctx {
     nthreads: usize,
     ws: i64,
     we: i64,
+    #[allow(dead_code)]
     products: FxMap<Vec<u8>, u16>,
     cat_names: Vec<Vec<u8>>,
     unknown_cat: u16,
+    #[allow(dead_code)]
     campaigns: FxMap<Vec<u8>, u16>,
     camp_ids: Vec<Vec<u8>>,
     camp_channels: Vec<Vec<u8>>,
-    links: Vec<Mmap>,
-    events: Vec<Mmap>,
-    clicks: Vec<Mmap>,
+    links: Vec<Input>,
+    events: Vec<Input>,
+    clicks: Vec<Input>,
+    use_read: bool,
     out_dir: PathBuf,
     check_split: bool,
+    tstab: fastpath::TsTab,
+    product_idx: fastpath::IdIndex,
+    campaign_idx: fastpath::IdIndex,
 }
 
 // ---------------------------------------------------------------- parallel helper
@@ -658,11 +697,12 @@ impl Parts {
 struct ParseState {
     ev: Vec<Vec<Ev>>,
     ck: Vec<Vec<Ck>>,
+    buf: Vec<u8>,
 }
 
 struct DedupState {
     out: Vec<Vec<Se>>,
-    table: Vec<Ev>,
+    table: Vec<[u64; 2]>,
     surv: Vec<Ev>,
 }
 
@@ -804,15 +844,35 @@ fn group_partition<'a>(
 
 // ---------------------------------------------------------------- the pipeline
 
-fn cpu_ms() -> f64 {
+fn cpu_ms() -> (f64, f64) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let tv = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
-    tv(ru.ru_utime) + tv(ru.ru_stime)
+    (tv(ru.ru_utime), tv(ru.ru_stime))
+}
+
+#[cfg(target_os = "macos")]
+fn instructions() -> f64 {
+    let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t)
+    };
+    if r == 0 { ri.ri_instructions as f64 / 1e9 } else { 0.0 }
+}
+#[cfg(not(target_os = "macos"))]
+fn instructions() -> f64 {
+    0.0
 }
 
 fn tlog(t0: &Instant, what: &str) {
-    eprintln!("[{:8.1} ms] [cpu {:8.1} ms] {what}", t0.elapsed().as_secs_f64() * 1e3, cpu_ms());
+    let (u, s) = cpu_ms();
+    eprintln!(
+        "[{:8.1} ms] [cpu {:8.1} ms] [sys {:7.1} ms] [ins {:6.2} G] {what}",
+        t0.elapsed().as_secs_f64() * 1e3,
+        u + s,
+        s,
+        instructions()
+    );
 }
 
 /// Calls `f` with the fields of every well-formed line in file[start..end] (N fields).
@@ -912,6 +972,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         || ParseState {
             ev: (0..np).map(|_| Vec::with_capacity(ev_res)).collect(),
             ck: (0..np).map(|_| Vec::with_capacity(ck_res)).collect(),
+            buf: Vec::new(),
         },
         |st, i| {
             let c = items[i];
@@ -919,19 +980,21 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                 let _ = persons.set(build_persons(&pairs));
                 tlog(t0, "persons built");
             } else if c.kind == 1 {
-                scan_lines::<7>(&ctx.events[c.file as usize], c.start, c.end, check, |f| {
+                let mut buf = std::mem::take(&mut st.buf);
+                with_chunk(&ctx.events[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
+                scan_lines::<7>(data, start, end, check, |f| {
                     if f[0].is_empty() {
                         return;
                     }
                     let eid = unsafe { pk.pack_padded(f[0]) };
-                    let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                    let ingest = ctx.tstab.parse(f[3]).unwrap_or(i64::MAX);
                     let ing_s = (ingest.div_euclid(1000) - ws_s).clamp(-INGEST_OFF, INGEST_OFF - 1) + INGEST_OFF;
                     let mut rec = Ev { eid, uid: 0, meta: (ing_s as u64) << 16, tp: 0 };
                     'v: {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
                         }
-                        let ts = match parse_ts(f[2]) {
+                        let ts = match ctx.tstab.parse(f[2]) {
                             Some(t) if t >= ws && t < we => t,
                             _ => break 'v,
                         };
@@ -946,7 +1009,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                                 Some(p) => price = p,
                                 None => break 'v,
                             }
-                            rec.meta |= *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat) as u64;
+                            rec.meta |= ctx.product_idx.get(f[5]).unwrap_or(ctx.unknown_cat) as u64;
                         }
                         if ingest.saturating_sub(ts) > DAY {
                             break 'v;
@@ -956,6 +1019,8 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                     }
                     st.ev[parts.by_eid(eid)].push(rec);
                 });
+                });
+                st.buf = buf;
             } else {
                 let pm = loop {
                     if let Some(p) = persons.get() {
@@ -973,12 +1038,14 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         ck[parts.by_person(person)].push(Ck { person, ts, cid, camp });
                     }
                 };
-                scan_lines::<4>(&ctx.clicks[c.file as usize], c.start, c.end, check, |f| {
+                let mut buf = std::mem::take(&mut st.buf);
+                with_chunk(&ctx.clicks[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
+                scan_lines::<4>(data, start, end, check, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
-                    let Some(&camp) = ctx.campaigns.get(f[2]) else { return };
-                    let ts = match parse_ts(f[3]) {
+                    let Some(camp) = ctx.campaign_idx.get(f[2]) else { return };
+                    let ts = match ctx.tstab.parse(f[3]) {
                         Some(t) if t >= cws && t < we => t,
                         _ => return,
                     };
@@ -992,6 +1059,8 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         n = 0;
                     }
                 });
+                });
+                st.buf = buf;
                 flush(&pend[..n], ck);
             }
         },
@@ -1010,23 +1079,25 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         || DedupState { out: (0..np).map(|_| Vec::with_capacity(se_res)).collect(), table: Vec::new(), surv: Vec::new() },
         |st, p| {
             let total: usize = parsed.iter().map(|s| s.ev[p].len()).sum();
-            let cap = (total * 2).next_power_of_two().max(16);
+            let cap = (total + total / 2).next_power_of_two().max(16);
             let mask = cap - 1;
             st.table.clear();
-            st.table.resize(cap, Ev::default());
+            st.table.resize(cap, [0, 0]);
             let t = &mut st.table;
-            for s in &parsed {
-                for &e in &s.ev[p] {
+            // entries: [event_id key, producer << 32 | index of the kept copy]
+            for (pi, s) in parsed.iter().enumerate() {
+                for (li, e) in s.ev[p].iter().enumerate() {
                     let mut i = (mix(e.eid) as usize) & mask;
                     loop {
                         let x = unsafe { t.get_unchecked_mut(i) };
-                        if x.eid == 0 {
-                            *x = e;
+                        if x[0] == 0 {
+                            *x = [e.eid, (pi as u64) << 32 | li as u64];
                             break;
                         }
-                        if x.eid == e.eid {
-                            if (e.meta >> 16) < (x.meta >> 16) {
-                                *x = e;
+                        if x[0] == e.eid {
+                            let cur = &parsed[(x[1] >> 32) as usize].ev[p][(x[1] & 0xffff_ffff) as usize];
+                            if (e.meta >> 16) < (cur.meta >> 16) {
+                                x[1] = (pi as u64) << 32 | li as u64;
                             }
                             break;
                         }
@@ -1036,8 +1107,11 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             }
             st.surv.clear();
             for x in t.iter() {
-                if x.tp & 1 != 0 {
-                    st.surv.push(*x);
+                if x[0] != 0 {
+                    let e = unsafe { parsed.get_unchecked((x[1] >> 32) as usize).ev.get_unchecked(p).get_unchecked((x[1] & 0xffff_ffff) as usize) };
+                    if e.tp & 1 != 0 {
+                        st.surv.push(*e);
+                    }
                 }
             }
             const D: usize = 8;
@@ -1234,11 +1308,109 @@ fn flush_ud(st: &mut AggState, person: u64, day: i64, sessions: i32, events: i32
     st.rows.push(UdRow { person, day: day as i32, sessions, events, revenue, top });
 }
 
+/// Single-thread microbenchmarks over the event files (development only).
+fn bench(ctx: &Ctx, mode: &str) {
+    let t = Instant::now();
+    let i0 = instructions();
+    let mut n = 0u64;
+    let mut acc = 0u64;
+    let p7 = Pack7 { fail: AtomicBool::new(false) };
+    for inp in &ctx.events {
+        let d: &[u8] = inp;
+        let start = memchr::memchr(b'\n', d).map_or(d.len(), |i| i + 1);
+        match mode {
+            "scan" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                acc = acc.wrapping_add(f[2].len() as u64 + f[6].len() as u64);
+            }),
+            "decode" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                let a = unsafe { p7.pack_padded(f[0]) } ^ unsafe { p7.pack_padded(f[1]) };
+                let b = ctx.tstab.parse(f[2]).unwrap_or(0) ^ ctx.tstab.parse(f[3]).unwrap_or(0);
+                acc = acc.wrapping_add(a ^ b as u64);
+            }),
+            "masks" => {
+                let mut pos = start;
+                let fe = d.len().saturating_sub(scan::FAST_SLACK);
+                while pos < fe {
+                    let (nl, cm, qm) = unsafe { scan::masks128(d.as_ptr().add(pos)) };
+                    acc = acc.wrapping_add((cm ^ qm) as u64);
+                    n += 1;
+                    pos += if nl == 0 { 128 } else { nl.trailing_zeros() as usize + 1 };
+                }
+            }
+            "memchr" => {
+                for _ in memchr::memchr_iter(b'\n', &d[start..]) {
+                    n += 1;
+                }
+            }
+            "ts" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(fastpath::ts_probe(&ctx.tstab, std::hint::black_box(f[3])).unwrap_or(0) as u64);
+                }
+            }),
+            "pack" => scan_lines::<7>(d, start, d.len(), false, |f| {
+                n += 1;
+                for _ in 0..10 {
+                    acc = acc.wrapping_add(unsafe { p7.pack_padded(std::hint::black_box(f[0])) });
+                }
+            }),
+            "tsconst" => {
+                if n == 0 {
+                    let mut b = [0u8; 48];
+                    b[..20].copy_from_slice(b"2026-10-03T23:58:10Z");
+                    for _ in 0..10_000_000 {
+                        n += 1;
+                        acc = acc.wrapping_add(ctx.tstab.parse(std::hint::black_box(&b[..20])).unwrap_or(0) as u64);
+                    }
+                }
+            }
+            "tsnull" => {
+                if n == 0 {
+                    let mut b = [0u8; 48];
+                    b[..20].copy_from_slice(b"2026-10-03T23:58:10Z");
+                    for _ in 0..10_000_000 {
+                        n += 1;
+                        let f = std::hint::black_box(&b[..20]);
+                        acc = acc.wrapping_add(f[3] as u64 + f.len() as u64);
+                    }
+                }
+            }
+            "calib" => {
+                if n == 0 {
+                    for _ in 0..100_000_000 {
+                        n += 1;
+                        acc = std::hint::black_box(acc.wrapping_mul(3).wrapping_add(1));
+                    }
+                }
+            }
+            "tsconst_old" => {
+                if n == 0 {
+                    let mut b = [0u8; 48];
+                    b[..20].copy_from_slice(b"2026-10-03T23:58:10Z");
+                    for _ in 0..10_000_000 {
+                        n += 1;
+                        acc = acc.wrapping_add(parse_ts(std::hint::black_box(&b[..20])).unwrap_or(0) as u64);
+                    }
+                }
+            }
+            _ => panic!("unknown bench"),
+        }
+    }
+    eprintln!(
+        "bench {mode}: {n} lines, {:.1} ms, {:.0} instructions/line, {:.1} ns/line (acc {acc})",
+        t.elapsed().as_secs_f64() * 1e3,
+        (instructions() - i0) * 1e9 / n as f64,
+        t.elapsed().as_secs_f64() * 1e9 / n as f64
+    );
+}
+
 // ---------------------------------------------------------------- fallback key table
 
 fn build_rank(ctx: &Ctx) -> RankPack {
     type Set<'a> = std::collections::HashSet<&'a [u8], BuildHasherDefault<Fx>>;
-    fn add_from<'a>(set: &mut Set<'a>, maps: &'a [Mmap], n: usize) {
+    fn add_from<'a>(set: &mut Set<'a>, maps: &'a [Input], n: usize) {
         for m in maps {
             let d: &'a [u8] = m;
             let start = memchr::memchr(b'\n', d).map(|i| i + 1).unwrap_or(d.len());
@@ -1331,6 +1503,8 @@ fn main() {
         camp_channels.push(ch);
     }
 
+    let product_idx = fastpath::IdIndex::new(b"p", &products);
+    let campaign_idx = fastpath::IdIndex::new(b"c_", &campaigns);
     let ctx = Ctx {
         nthreads,
         ws,
@@ -1346,9 +1520,17 @@ fn main() {
         clicks: map_files(&list_csv(&data.join("clicks"))),
         out_dir: out,
         check_split: std::env::var_os("SS_CHECK_SPLIT").is_some(),
+        tstab: fastpath::TsTab::new(ws - WEEK, we),
+        use_read: std::env::var_os("SS_READ").is_some(),
+        product_idx,
+        campaign_idx,
     };
     tlog(&t0, "inputs mapped");
 
+    if let Ok(mode) = std::env::var("SS_BENCH") {
+        bench(&ctx, &mode);
+        std::process::exit(0);
+    }
     let p7 = Pack7 { fail: AtomicBool::new(false) };
     // SS_FORCE_RANK=1 forces the fallback key path (used by the tests).
     let force_rank = std::env::var_os("SS_FORCE_RANK").is_some();
@@ -1398,27 +1580,59 @@ mod tests {
     }
 
     #[test]
-    fn fast_fields_match_split() {
-        let alphabet: &[u8] = b"\"\",,,a1 \r\t\n";
-        let mut s = 0x9e37_79b9_7f4a_7c15u64;
-        for _ in 0..2_000_000 {
-            let n = (rng(&mut s) % 40) as usize;
-            let mut buf = [b'x'; 200];
+    fn fast_ts_matches_parse_ts() {
+        let ws = 1_791_072_000_000i64; // 2026-10-04
+        let tab = fastpath::TsTab::new(ws - WEEK, ws + 14 * DAY);
+        let mut s = 0x5555_1234_9999_0001u64;
+        let digits = b"0123456789";
+        let pieces: [&[u8]; 10] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"2027-02-29T10:00:00Z", b"2026-09-30T23:59:59+05:30", b"2026-10-14T23:59:59-10:00", b"1791071890000", b"2026-12-31T23:59:59Z", b"0000-01-01T00:00:00Z", b"9999999999999", b"0000000000000"];
+        for _ in 0..3_000_000 {
+            let mut buf = [0u8; 48];
+            let src = pieces[(rng(&mut s) % pieces.len() as u64) as usize];
+            buf[..src.len()].copy_from_slice(src);
+            let n = src.len();
+            // mutate 0-2 bytes into digits, separators or junk
+            for _ in 0..(rng(&mut s) % 3) {
+                let i = (rng(&mut s) % n as u64) as usize;
+                let r = rng(&mut s);
+                buf[i] = match r % 4 { 0 | 1 => digits[(r >> 8) as usize % 10], 2 => { let j: &[u8] = b"-:TZ+ tz\xff/"; j[(r >> 8) as usize % j.len()] }, _ => (r >> 16) as u8 };
+            }
+            let f = &buf[..n];
+            assert_eq!(tab.parse(f), parse_ts(f), "{:?}", String::from_utf8_lossy(f));
+        }
+    }
+
+    fn check_fields<const N: usize>(alphabet: &[u8], maxlen: u64, iters: usize, seed: u64) {
+        let mut s = seed;
+        for _ in 0..iters {
+            let n = (rng(&mut s) % maxlen) as usize;
+            let mut buf = [b'x'; 300];
             for b in buf[..n].iter_mut() {
                 *b = alphabet[(rng(&mut s) % alphabet.len() as u64) as usize];
             }
             buf[n] = b'\n';
             let (nl, cm, qm) = unsafe { scan::masks128(buf.as_ptr()) };
+            if nl == 0 {
+                continue;
+            }
             let len = nl.trailing_zeros() as usize;
             let line = &buf[..len];
-            let mut a: [&[u8]; 4] = [b""; 4];
-            let mut b: [&[u8]; 4] = [b""; 4];
-            let oa = scan::fields::<4>(line, cm, qm, &mut a);
-            let ob = split::<4>(line, &mut b);
-            assert_eq!(oa, ob, "{line:?}");
+            let mut a: [&[u8]; N] = [b""; N];
+            let mut b: [&[u8]; N] = [b""; N];
+            let oa = scan::fields::<N>(line, cm, qm, &mut a);
+            let ob = split::<N>(line, &mut b);
+            assert_eq!(oa, ob, "{:?}", String::from_utf8_lossy(line));
             if oa {
                 assert_eq!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn fast_fields_match_split() {
+        check_fields::<4>(b"\"\",,,a1 \r\t\n", 40, 2_000_000, 0x9e37_79b9_7f4a_7c15);
+        check_fields::<7>(b"\"\",,,,,a1 \r", 127, 2_000_000, 0x1234_9e37_79b9_7f4a);
+        check_fields::<7>(b"\",aaaaaaaaaaaaaaaa", 127, 2_000_000, 0x7f4a_1234_9e37_79b9);
+        check_fields::<2>(b"\"\",a\t", 12, 1_000_000, 0x55aa_1234_9e37_79b9);
     }
 }
