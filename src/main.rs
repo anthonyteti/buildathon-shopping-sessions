@@ -279,8 +279,16 @@ impl Packer for Pack7 {
         }
         let raw = u64::from_le(unsafe { (f.as_ptr() as *const u64).read_unaligned() });
         let lo = n.min(8);
-        let mask = if lo == 8 { u64::MAX } else { (1u64 << (8 * lo)) - 1 };
-        let w = raw & mask;
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let (w, mask) = {
+            let w = unsafe { std::arch::x86_64::_bzhi_u64(raw, (8 * lo) as u32) };
+            (w, unsafe { std::arch::x86_64::_bzhi_u64(u64::MAX, (8 * lo) as u32) })
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let (w, mask) = {
+            let mask = if lo == 8 { u64::MAX } else { (1u64 << (8 * lo)) - 1 };
+            (raw & mask, mask)
+        };
         let b8 = if n == 9 { (unsafe { *f.get_unchecked(8) }) as u64 } else { 0 };
         let probe = w | (!mask & 0x0101_0101_0101_0101);
         let high = w & 0x8080_8080_8080_8080 != 0;

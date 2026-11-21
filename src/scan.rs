@@ -142,18 +142,26 @@ pub fn fields<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut 
             return false;
         }
     }
-    let mut x = clo as u128 | (chi as u128) << 64;
-    let mut s = 0usize;
+    // separator positions: the low half's commas, then the high half's
+    let mut pos = [0usize; N];
+    let mut k = 0usize;
+    let mut x = clo;
+    while x != 0 {
+        unsafe { *pos.get_unchecked_mut(k) = x.trailing_zeros() as usize };
+        x &= x - 1;
+        k += 1;
+    }
+    let mut y = chi;
+    while y != 0 {
+        unsafe { *pos.get_unchecked_mut(k) = 64 + y.trailing_zeros() as usize };
+        y &= y - 1;
+        k += 1;
+    }
+    pos[N - 1] = len;
     let base = line.as_ptr();
+    let mut s = 0usize;
     for k in 0..N {
-        let e = if k + 1 < N {
-            let lo = x as u64;
-            let e = if lo != 0 { lo.trailing_zeros() } else { 64 + ((x >> 64) as u64).trailing_zeros() } as usize;
-            x &= x - 1;
-            e
-        } else {
-            len
-        };
+        let e = pos[k];
         // a quote at a field start means a validated quoted field (line[len] is '\n')
         let qd = (unsafe { *base.add(s) } == b'"') as usize;
         out[k] = unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) };
