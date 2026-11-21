@@ -18,6 +18,7 @@ mod arena;
 mod fastpath;
 mod parquet_out;
 mod scan;
+mod scatter;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -675,6 +676,7 @@ fn par_run<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(nt: usize,
 /// meta = ingest seconds (48 bits, offset by 2^47 from window start) << 16 | category.
 /// tp   = (ts - window_start) ms << 26 | price << 2 | flags (1 = valid, 2 = purchase).
 #[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
 struct Ev {
     eid: u64,
     uid: u64,
@@ -692,7 +694,8 @@ struct Se {
 }
 
 /// A surviving view or cart event (no price): 16 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
 struct Sv {
     person: u64,
     ts: i64,
@@ -724,7 +727,8 @@ impl Ev2 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
 struct Ck {
     person: u64,
     ts: i64,
@@ -766,8 +770,8 @@ impl Parts {
 }
 
 struct ParseState {
-    ev: Vec<Vec<Ev>>,
-    ck: Vec<Vec<Ck>>,
+    ev: scatter::Scatter<Ev, 2>,
+    ck: scatter::Scatter<Ck, 2>,
     buf: Vec<u8>,
 }
 
@@ -1084,11 +1088,12 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let ev_bytes: usize = ctx.events.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ctx.clicks.iter().map(|m| m.len()).sum();
     let est_events = ev_bytes / 70 + 1;
-    let mut bits = 8u32;
-    while bits < 11 && (est_events >> bits) > 16_384 {
+    let max_bits: u32 = std::env::var("SS_EBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(11);
+    let mut bits = 8u32.min(max_bits);
+    while bits < max_bits && (est_events >> bits) > 16_384 {
         bits += 1;
     }
-    let pdelta: u32 = std::env::var("SS_PDELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let pdelta: u32 = std::env::var("SS_PDELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     let parts = Parts { bits, pbits: bits.saturating_sub(pdelta).max(4) };
     let np = parts.n();
     let npp = parts.np();
@@ -1109,8 +1114,8 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         nt,
         items.len(),
         || ParseState {
-            ev: (0..np).map(|_| Vec::with_capacity(ev_res)).collect(),
-            ck: (0..npp).map(|_| Vec::with_capacity(ck_res)).collect(),
+            ev: scatter::Scatter::new(np, ev_res),
+            ck: scatter::Scatter::new(npp, ck_res),
             buf: Vec::new(),
         },
         |st, i| {
@@ -1163,9 +1168,11 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         rec.uid = unsafe { pk.pack_padded(f[1]) };
                         rec.tp = ((ts - ws) as u64) << 26 | (price as u64) << 2 | 1 | if purchase { 2 } else { 0 };
                     }
-                    st.ev[parts.by_eid(eid)].push(rec);
+                    st.ev.push(parts.by_eid(eid), rec);
                 });
                 });
+                // order this thread's streaming stores before anyone reads the buffers
+                scatter::fence();
                 st.buf = buf;
             } else {
                 let pm = loop {
@@ -1178,10 +1185,10 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                 let mut pend = [(0u64, 0i64, 0u64, 0u16); B];
                 let mut n = 0usize;
                 let ck = &mut st.ck;
-                let flush = |pend: &[(u64, i64, u64, u16)], ck: &mut Vec<Vec<Ck>>| {
+                let flush = |pend: &[(u64, i64, u64, u16)], ck: &mut scatter::Scatter<Ck, 2>| {
                     for &(uid, ts, cid, camp) in pend {
                         let person = pm.get(uid);
-                        ck[parts.by_person(person)].push(Ck { person, ts, cid, camp });
+                        ck.push(parts.by_person(person), Ck { person, ts, cid, camp });
                     }
                 };
                 let mut buf = std::mem::take(&mut st.buf);
@@ -1208,9 +1215,16 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                 });
                 st.buf = buf;
                 flush(&pend[..n], ck);
+                scatter::fence();
             }
         },
     );
+    let mut parsed = parsed;
+    for s in parsed.iter_mut() {
+        s.ev.finish();
+        s.ck.finish();
+    }
+    let parsed = parsed;
     tlog(t0, "events and clicks parsed");
     if pk.failed() {
         return None;
@@ -1229,7 +1243,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             surv: Vec::new(),
         },
         |st, p| {
-            let total: usize = parsed.iter().map(|s| s.ev[p].len()).sum();
+            let total: usize = parsed.iter().map(|s| s.ev.vecs[p].len()).sum();
             let cap = (total + total / 2).next_power_of_two().max(16);
             let mask = cap - 1;
             st.table.clear();
@@ -1237,7 +1251,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             let t = &mut st.table;
             // entries: [event_id key, producer << 32 | index of the kept copy]
             for (pi, s) in parsed.iter().enumerate() {
-                for (li, e) in s.ev[p].iter().enumerate() {
+                for (li, e) in s.ev.vecs[p].iter().enumerate() {
                     let mut i = (mix(e.eid) as usize) & mask;
                     loop {
                         let x = unsafe { t.get_unchecked_mut(i) };
@@ -1246,7 +1260,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                             break;
                         }
                         if x[0] == e.eid {
-                            let cur = &parsed[(x[1] >> 32) as usize].ev[p][(x[1] & 0xffff_ffff) as usize];
+                            let cur = &parsed[(x[1] >> 32) as usize].ev.vecs[p][(x[1] & 0xffff_ffff) as usize];
                             if (e.meta >> 16) < (cur.meta >> 16) {
                                 x[1] = (pi as u64) << 32 | li as u64;
                             }
@@ -1259,7 +1273,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             st.surv.clear();
             for x in t.iter() {
                 if x[0] != 0 {
-                    let e = unsafe { parsed.get_unchecked((x[1] >> 32) as usize).ev.get_unchecked(p).get_unchecked((x[1] & 0xffff_ffff) as usize) };
+                    let e = unsafe { parsed.get_unchecked((x[1] >> 32) as usize).ev.vecs.get_unchecked(p).get_unchecked((x[1] & 0xffff_ffff) as usize) };
                     if e.tp & 1 != 0 {
                         st.surv.push(*e);
                     }
@@ -1317,7 +1331,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         |st, oi| {
             let (n, q) = order[oi];
             let mut g = std::mem::take(&mut st.g);
-            group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), deduped.iter().map(|d| d.outp[q].as_slice()), parsed.iter().map(|s| s.ck[q].as_slice()));
+            group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), deduped.iter().map(|d| d.outp[q].as_slice()), parsed.iter().map(|s| s.ck.vecs[q].as_slice()));
             for l in 0..g.off.len() - 1 {
                 let ev = &g.evs[g.off[l] as usize..g.off[l + 1] as usize];
                 let person = g.pkey[l];
