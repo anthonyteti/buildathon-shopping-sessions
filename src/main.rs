@@ -222,6 +222,12 @@ pub trait Packer: Sync {
     unsafe fn pack_padded(&self, f: &[u8]) -> u64 {
         self.pack(f)
     }
+    /// `pack_padded`, told whether every byte around `f` is known to be 1..=127.
+    #[inline(always)]
+    unsafe fn pack_clean(&self, f: &[u8], clean: bool) -> u64 {
+        let _ = clean;
+        unsafe { self.pack_padded(f) }
+    }
     fn unpack(&self, k: u64, out: &mut Vec<u8>);
     fn failed(&self) -> bool;
 }
@@ -299,6 +305,22 @@ impl Packer for Pack7 {
             self.fail.store(true, Relaxed);
             return 1;
         }
+        (compress7(w.swap_bytes()) << 7) | b8
+    }
+    #[inline(always)]
+    unsafe fn pack_clean(&self, f: &[u8], clean: bool) -> u64 {
+        let n = f.len();
+        if !clean || n == 0 || n > 9 {
+            return unsafe { self.pack_padded(f) };
+        }
+        // every byte is 1..=127: no checks
+        let raw = u64::from_le(unsafe { (f.as_ptr() as *const u64).read_unaligned() });
+        let lo = n.min(8);
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let w = unsafe { std::arch::x86_64::_bzhi_u64(raw, (8 * lo) as u32) };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let w = if lo == 8 { raw } else { raw & ((1u64 << (8 * lo)) - 1) };
+        let b8 = if n == 9 { (unsafe { *f.get_unchecked(8) }) as u64 } else { 0 };
         (compress7(w.swap_bytes()) << 7) | b8
     }
     fn unpack(&self, k: u64, out: &mut Vec<u8>) {
@@ -958,9 +980,7 @@ fn group_partition<'a>(
     scatter_lids(g, &mut k, pur_in);
     for l in 0..nl {
         let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
-        if s.len() > 1 {
-            s.sort_unstable_by_key(|e| e.ts);
-        }
+        sort_by_ts(s);
     }
     group_clicks(g, mask, cks_in);
 }
@@ -1014,9 +1034,40 @@ fn group_clicks<'a>(g: &mut Group, mask: usize, cks_in: impl Iterator<Item = &'a
     }
     for l in 0..nl {
         let s = &mut g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
-        if s.len() > 1 {
-            s.sort_unstable_by_key(|c| (c.ts, c.cid));
+        sort_clicks(s);
+    }
+}
+
+/// Insertion sort for the short slices most persons have; the library sort otherwise.
+#[inline(always)]
+fn insertion_sort<T: Copy, K: PartialOrd>(s: &mut [T], key: impl Fn(&T) -> K) {
+    for i in 1..s.len() {
+        let x = s[i];
+        let kx = key(&x);
+        let mut j = i;
+        while j > 0 && key(unsafe { s.get_unchecked(j - 1) }) > kx {
+            unsafe { *s.get_unchecked_mut(j) = *s.get_unchecked(j - 1) };
+            j -= 1;
         }
+        unsafe { *s.get_unchecked_mut(j) = x };
+    }
+}
+
+#[inline(always)]
+fn sort_by_ts(s: &mut [Ev2]) {
+    if s.len() <= 24 {
+        insertion_sort(s, |e| e.ts);
+    } else {
+        s.sort_unstable_by_key(|e| e.ts);
+    }
+}
+
+#[inline(always)]
+fn sort_clicks(s: &mut [Ck]) {
+    if s.len() <= 24 {
+        insertion_sort(s, |c| (c.ts, c.cid));
+    } else {
+        s.sort_unstable_by_key(|c| (c.ts, c.cid));
     }
 }
 

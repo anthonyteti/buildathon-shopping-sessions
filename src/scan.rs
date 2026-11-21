@@ -298,11 +298,12 @@ fn quotes_bad(len: usize, clo: u64, chi: u64, qlo: u64, qhi: u64) -> bool {
     (bad_lo | bad_hi) != 0
 }
 
-/// Masks of '\n', ',' and '"' over the 96 bytes at `p`, as 64-bit low halves (bytes
-/// 0..64) and 32-bit high halves (bytes 64..96): [nlo, nhi, clo, chi, qlo, qhi].
+/// Masks of '\n', ',', '"' and of bytes that are NUL or >= 0x80 over the 96 bytes at
+/// `p`, as 64-bit low halves (bytes 0..64) and 32-bit high halves (bytes 64..96):
+/// [nlo, nhi, clo, chi, qlo, qhi, blo, bhi].
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
+pub unsafe fn masks96(p: *const u8) -> [u64; 8] {
     use std::arch::x86_64::*;
     unsafe {
         let vn = _mm256_set1_epi8(b'\n' as i8);
@@ -315,6 +316,12 @@ pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
         unsafe fn m(v: __m256i, c: __m256i) -> u64 {
             unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64 }
         }
+        // bytes that are NUL or >= 0x80
+        let z = _mm256_setzero_si256();
+        #[inline(always)]
+        unsafe fn b(v: __m256i, z: __m256i) -> u64 {
+            unsafe { _mm256_movemask_epi8(_mm256_or_si256(v, _mm256_cmpeq_epi8(v, z))) as u32 as u64 }
+        }
         [
             m(v0, vn) | m(v1, vn) << 32,
             m(v2, vn),
@@ -322,16 +329,23 @@ pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
             m(v2, vc),
             m(v0, vq) | m(v1, vq) << 32,
             m(v2, vq),
+            b(v0, z) | b(v1, z) << 32,
+            b(v2, z),
         ]
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
+pub unsafe fn masks96(p: *const u8) -> [u64; 8] {
     let (n, c, q) = unsafe { masks128(p) };
     let h = |x: u128| (x >> 64) as u64 & 0xFFFF_FFFF;
-    [n as u64, h(n), c as u64, h(c), q as u64, h(q)]
+    let mut bad = 0u128;
+    for i in 0..96 {
+        let x = unsafe { *p.add(i) };
+        bad |= ((x == 0 || x >= 0x80) as u128) << i;
+    }
+    [n as u64, h(n), c as u64, h(c), q as u64, h(q), bad as u64, h(bad)]
 }
 
 #[inline(always)]
@@ -383,6 +397,66 @@ pub fn positions96<const N: usize>(len: usize, clo: u64, chi: u64, qlo: u64, qhi
         let src = if in_lo { clo } else { chi };
         let j = if in_lo { k } else { k - nlo };
         pos[k as usize] = (select(src, j) + if in_lo { 0 } else { 64 }) as usize;
+    }
+    pos[N - 1] = len;
+    Some(quoted)
+}
+
+/// Masks of '\n', ',', '"' and of bytes that are NUL or >= 0x80 over the 64 bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn masks64(p: *const u8) -> [u64; 4] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        #[inline(always)]
+        unsafe fn m(v: __m256i, c: u8) -> u64 {
+            unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64 }
+        }
+        #[inline(always)]
+        unsafe fn b(v: __m256i) -> u64 {
+            unsafe { _mm256_movemask_epi8(_mm256_or_si256(v, _mm256_cmpeq_epi8(v, _mm256_setzero_si256()))) as u32 as u64 }
+        }
+        [
+            m(v0, b'\n') | m(v1, b'\n') << 32,
+            m(v0, b',') | m(v1, b',') << 32,
+            m(v0, b'"') | m(v1, b'"') << 32,
+            b(v0) | b(v1) << 32,
+        ]
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub unsafe fn masks64(p: *const u8) -> [u64; 4] {
+    let m = unsafe { masks96(p) };
+    [m[0], m[2], m[4], m[6]]
+}
+
+/// `positions` for a line of len < 64 bytes from 64-bit masks: with the comma count
+/// checked first, the N - 1 positions come from a fixed number of tzcnt/blsr steps.
+#[inline(always)]
+pub fn positions64<const N: usize>(len: usize, cm: u64, qm: u64, pos: &mut [usize; N]) -> Option<bool> {
+    debug_assert!(len < 64);
+    let lm = (1u64 << len) - 1;
+    let c = cm & lm;
+    if c.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let q = qm & lm;
+    let quoted = q != 0;
+    let seps = c | (1u64 << len);
+    let starts = (c << 1) | 1;
+    let ends = seps >> 1;
+    let bad = (q & !(starts | ends)) | (q & starts & ends) | (pxor64(q) & seps);
+    if bad != 0 {
+        return None;
+    }
+    let mut x = c;
+    for k in 0..N - 1 {
+        pos[k] = x.trailing_zeros() as usize;
+        x &= x.wrapping_sub(1);
     }
     pos[N - 1] = len;
     Some(quoted)

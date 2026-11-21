@@ -66,6 +66,12 @@ impl TsTab {
     fn civil(&self, f: &[u8]) -> Option<i64> {
         let f: &[u8; 19] = f[..19].try_into().unwrap();
         let Some(days) = self.date(f) else { return civil_ms(f) };
+        Self::civil_time(f, days)
+    }
+
+    /// The "THH:MM:SS" part of `civil` (bytes 10..19) on top of a known date.
+    #[inline(always)]
+    fn civil_time(f: &[u8; 19], days: i64) -> Option<i64> {
         // "HH:MM:SS" at bytes 11..19
         let t = u64::from_le_bytes(f[11..19].try_into().unwrap());
         const DM: u64 = 0xFFFF_00FF_FF00_FFFF;
@@ -115,6 +121,31 @@ impl TsTab {
         }
         let ms = self.parse(f).unwrap_or(i64::MAX);
         (ms, ms.div_euclid(1000))
+    }
+
+    /// (`parse(t)`, `ingest_ms_s(g)`) for an event's ts and ingest_ts. When both are
+    /// 20-byte timestamps on the same date, the date is looked up once.
+    #[inline(always)]
+    pub fn ts_ingest(&self, t: &[u8], g: &[u8]) -> (Option<i64>, i64, i64) {
+        if t.len() == 20 && g.len() == 20 && t[19] == b'Z' {
+            let a = u64::from_le_bytes(t[0..8].try_into().unwrap());
+            let d = u16::from_le_bytes([t[8], t[9]]);
+            let e = unsafe { *self.slots.get_unchecked(Self::hash(self.mult, a, d)) };
+            let b = u64::from_le_bytes(g[0..8].try_into().unwrap());
+            let gd = u16::from_le_bytes([g[8], g[9]]);
+            if e.0 == a && e.1 == d && a == b && d == gd {
+                let days = e.2;
+                let ts = Self::civil_time(t[..19].try_into().unwrap(), days);
+                let w = u64::from_le_bytes(g[11..19].try_into().unwrap());
+                let v = w & 0x0F0F_0F0F_0F0F_0F0F;
+                let p = v * 10 + (v >> 8);
+                let (h, mi, s) = ((p & 0xFF) as i64, ((p >> 24) & 0xFF) as i64, ((p >> 48) & 0xFF) as i64);
+                let secs = days * 86_400 + (h * 60 + mi) * 60 + s;
+                return (ts, secs * 1000, secs);
+            }
+        }
+        let (m, s) = self.ingest_ms_s(g);
+        (self.parse(t), m, s)
     }
 
     /// Same result as `parse_ts`.

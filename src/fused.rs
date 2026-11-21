@@ -128,18 +128,9 @@ impl CMap {
     fn prefetch_filter(&self, k: u64) {
         prefetch(self.filt.as_ptr().wrapping_add(self.fpos(k) >> 6));
     }
+    /// Person name of an ID that passed the filter.
     #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        if self.maybe(k) {
-            self.prefetch_slot(k);
-        }
-    }
-    /// Person name of ID k.
-    #[inline(always)]
-    fn get(&self, k: u64) -> u64 {
-        if !self.maybe(k) {
-            return k;
-        }
+    fn get_linked(&self, k: u64) -> u64 {
         let mut i = mix(k) as usize & self.mask;
         loop {
             let s = unsafe { self.t.get_unchecked(i) };
@@ -305,49 +296,34 @@ pub fn run_fused<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                     ws_s,
                     tid,
                     st,
-                    pend: [(0u64, 0u64, 0u64, 0i64, 0u32, 0u16, false); PB],
+                    pend: [(0u64, 0u64, 0u64, 0i64, 0u32, 0u16, false); 2 * PB],
+                    linked: [false; 2 * PB],
+                    cur: 0,
                     n: 0,
+                    prev_n: 0,
                 };
                 with_chunk(&ctx.events[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
                     scan_events2(data, start, end, check, &mut sink);
                 });
                 sink.flush();
             } else {
-                const B: usize = 16;
-                let mut pend = [(0u64, 0i64, 0u64, 0u16); B];
-                let mut n = 0usize;
-                let flush = |pend: &[(u64, i64, u64, u16)], ck: &mut scatter::Scatter<Ck, 2>| {
-                    for &(uid, _, _, _) in pend {
-                        cm.prefetch(uid);
-                    }
-                    for &(uid, ts, cid, camp) in pend {
-                        let person = cm.get(uid);
-                        ck.push(parts.by_person(person), Ck { person, ts, cid, camp });
-                    }
+                let mut sink = CkSink {
+                    ctx,
+                    pk,
+                    cm: &cm,
+                    parts,
+                    cws,
+                    ck: &mut st.ck,
+                    pend: [(0u64, 0i64, 0u64, 0u16); 2 * PB],
+                    linked: [false; 2 * PB],
+                    cur: 0,
+                    n: 0,
+                    prev_n: 0,
                 };
-                let ck = &mut st.ck;
                 with_chunk(&ctx.clicks[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
-                    scan_lines::<4>(data, start, end, check, |f| {
-                        if f[0].is_empty() || f[1].is_empty() {
-                            return;
-                        }
-                        let Some(camp) = ctx.campaign_idx.get(f[2]) else { return };
-                        let ts = match ctx.tstab.parse(f[3]) {
-                            Some(t) if t >= cws && t < we => t,
-                            _ => return,
-                        };
-                        let cid = unsafe { pk.pack_padded(f[0]) };
-                        let uid = unsafe { pk.pack_padded(f[1]) };
-                        cm.prefetch_filter(uid);
-                        pend[n] = (uid, ts, cid, camp);
-                        n += 1;
-                        if n == B {
-                            flush(&pend, ck);
-                            n = 0;
-                        }
-                    });
+                    scan_clicks2(data, start, end, check, &mut sink);
                 });
-                flush(&pend[..n], ck);
+                sink.flush();
             }
             scatter::fence();
             st.buf = buf;
@@ -544,9 +520,7 @@ fn group_fused(g: &mut Group, n: usize, parsed: &[PState], dead: &[Dead], q: usi
     }
     for l in 0..nl {
         let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
-        if s.len() > 1 {
-            s.sort_unstable_by_key(|e| e.ts);
-        }
+        sort_by_ts(s);
     }
     group_clicks(g, mask, parsed.iter().map(|s| s.ck.vecs[q].as_slice()));
 }
@@ -589,14 +563,19 @@ struct EvSink<'a, P: Packer> {
     ws_s: i64,
     tid: u32,
     st: &'a mut PState,
-    pend: [Pe; PB],
+    /// two halves of PB: the current one fills while the other one's lookups are in
+    /// flight (its slots were prefetched when it filled)
+    pend: [Pe; 2 * PB],
+    linked: [bool; 2 * PB],
+    cur: usize,
     n: usize,
+    prev_n: usize,
 }
 
 impl<'a, P: Packer> EvSink<'a, P> {
     /// One well-formed line; `fs[k]` is field k (quotes stripped, 16 readable bytes).
     #[inline(always)]
-    fn line(&mut self, fs: &[(*const u8, usize); 7]) {
+    fn line(&mut self, fs: &[(*const u8, usize); 7], clean: bool) {
         let f = |k: usize| unsafe { std::slice::from_raw_parts(fs[k].0, fs[k].1) };
         let ctx = self.ctx;
         let pk = self.pk;
@@ -605,8 +584,8 @@ impl<'a, P: Packer> EvSink<'a, P> {
         if f0.is_empty() {
             return;
         }
-        let eid = unsafe { pk.pack_padded(f0) };
-        let (ingest, ing_s) = ctx.tstab.ingest_ms_s(f(3));
+        let eid = unsafe { pk.pack_clean(f0, clean) };
+        let (ts_opt, ingest, ing_s) = ctx.tstab.ts_ingest(f(2), f(3));
         let ing_rel = ing_s - self.ws_s;
         if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
             self.st.bad = true;
@@ -618,7 +597,7 @@ impl<'a, P: Packer> EvSink<'a, P> {
             if f1.is_empty() || f5.is_empty() {
                 break 'v;
             }
-            let ts = match ctx.tstab.parse(f(2)) {
+            let ts = match ts_opt {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -645,12 +624,12 @@ impl<'a, P: Packer> EvSink<'a, P> {
             if ingest.saturating_sub(ts) > DAY {
                 break 'v;
             }
-            let uid = unsafe { pk.pack_padded(f1) };
+            let uid = unsafe { pk.pack_clean(f1, clean) };
             self.cm.prefetch_filter(uid);
-            unsafe { *self.pend.get_unchecked_mut(self.n) = (eid, ing, uid, ts, price, cat, purchase) };
+            unsafe { *self.pend.get_unchecked_mut(self.cur * PB + self.n) = (eid, ing, uid, ts, price, cat, purchase) };
             self.n += 1;
             if self.n == PB {
-                self.flush();
+                self.rotate();
             }
             return;
         }
@@ -658,16 +637,45 @@ impl<'a, P: Packer> EvSink<'a, P> {
         self.st.er.push(self.parts.by_eid(eid), Er { eid, x: ing << 32 | NONE as u64 });
     }
 
+    /// The current half is full: prefetch its person slots, then resolve the other half.
     #[inline(never)]
+    fn rotate(&mut self) {
+        self.prefetch_half(self.cur, self.n);
+        self.process(self.cur ^ 1, self.prev_n);
+        self.prev_n = self.n;
+        self.cur ^= 1;
+        self.n = 0;
+    }
+
+    /// Resolves everything still pending.
     fn flush(&mut self) {
-        let (cm, parts, tid) = (self.cm, self.parts, self.tid);
-        let pend = &self.pend[..self.n];
-        let st = &mut *self.st;
-        for p in pend {
-            cm.prefetch(p.2);
+        self.prefetch_half(self.cur, self.n);
+        self.process(self.cur ^ 1, self.prev_n);
+        self.process(self.cur, self.n);
+        self.prev_n = 0;
+        self.n = 0;
+    }
+
+    #[inline(always)]
+    fn prefetch_half(&mut self, h: usize, n: usize) {
+        let cm = self.cm;
+        for i in h * PB..h * PB + n {
+            let uid = self.pend[i].2;
+            let m = cm.maybe(uid);
+            self.linked[i] = m;
+            if m {
+                cm.prefetch_slot(uid);
+            }
         }
-        for &(eid, ing, uid, ts, price, cat, purchase) in pend {
-            let person = cm.get(uid);
+    }
+
+    #[inline(always)]
+    fn process(&mut self, h: usize, n: usize) {
+        let (cm, parts, tid) = (self.cm, self.parts, self.tid);
+        let st = &mut *self.st;
+        for i in h * PB..h * PB + n {
+            let (eid, ing, uid, ts, price, cat, purchase) = self.pend[i];
+            let person = if self.linked[i] { cm.get_linked(uid) } else { uid };
             let q = parts.by_person(person);
             let (kind, idx) = if purchase {
                 let idx = st.se[q].len();
@@ -684,7 +692,6 @@ impl<'a, P: Packer> EvSink<'a, P> {
             let loc = tid << 28 | kind << 27 | (q as u32) << IDX_BITS | idx as u32 & ((1 << IDX_BITS) - 1);
             st.er.push(parts.by_eid(eid), Er { eid, x: ing << 32 | loc as u64 });
         }
-        self.n = 0;
     }
 }
 
@@ -702,9 +709,11 @@ fn scan_events2<P: Packer>(file: &[u8], start: usize, end: usize, check: bool, s
             prefetch(file.as_ptr().wrapping_add(pos + PF_DIST));
             prefetch(file.as_ptr().wrapping_add(pos + PF_DIST + 64));
             let base = unsafe { file.as_ptr().add(pos) };
-            let [nlo, nhi, clo, chi, qlo, qhi] = unsafe { scan::masks96(base) };
+            let [nlo, nhi, clo, chi, qlo, qhi, blo, bhi] = unsafe { scan::masks96(base) };
+            let mut clean = false;
             let (len, r) = if nlo == 0 && nhi != 0 {
                 let len = 64 + nhi.trailing_zeros() as usize;
+                clean = (blo | (bhi & ((1u64 << (len - 64)) - 1))) == 0;
                 (len, scan::positions96::<7>(len, clo, chi, qlo, qhi, &mut p))
             } else if nlo != 0 {
                 let len = nlo.trailing_zeros() as usize;
@@ -741,7 +750,13 @@ fn scan_events2<P: Packer>(file: &[u8], start: usize, end: usize, check: bool, s
                         fs[k] = (unsafe { base.add(s + qd) }, e - s - 2 * qd);
                         s = e + 1;
                     }
-                    sink.line(&fs);
+                    if check {
+                        for k in 0..2 {
+                            let fk = unsafe { std::slice::from_raw_parts(fs[k].0, fs[k].1) };
+                            assert_eq!(unsafe { sink.pk.pack_clean(fk, clean) }, unsafe { sink.pk.pack_padded(fk) });
+                        }
+                    }
+                    sink.line(&fs, clean);
                 }
                 pos += len + 1;
                 continue;
@@ -754,7 +769,161 @@ fn scan_events2<P: Packer>(file: &[u8], start: usize, end: usize, check: bool, s
         let line = &buf[..e - pos];
         let mut o: [&[u8]; 7] = [b""; 7];
         if split::<7>(line, &mut o) {
-            sink.line(&o.map(|x| (x.as_ptr(), x.len())));
+            sink.line(&o.map(|x| (x.as_ptr(), x.len())), false);
+        }
+        pos = e + 1;
+    }
+}
+
+/// Click lines into person partitions, with the same two-half person lookup as `EvSink`.
+struct CkSink<'a, P: Packer> {
+    ctx: &'a Ctx,
+    pk: &'a P,
+    cm: &'a CMap,
+    parts: Parts,
+    cws: i64,
+    ck: &'a mut scatter::Scatter<Ck, 2>,
+    pend: [(u64, i64, u64, u16); 2 * PB],
+    linked: [bool; 2 * PB],
+    cur: usize,
+    n: usize,
+    prev_n: usize,
+}
+
+impl<'a, P: Packer> CkSink<'a, P> {
+    /// One well-formed click line; `fs[k]` is field k (quotes stripped, 16 readable bytes).
+    #[inline(always)]
+    fn line(&mut self, fs: &[(*const u8, usize); 4], clean: bool) {
+        let f = |k: usize| unsafe { std::slice::from_raw_parts(fs[k].0, fs[k].1) };
+        let ctx = self.ctx;
+        let (f0, f1) = (f(0), f(1));
+        if f0.is_empty() || f1.is_empty() {
+            return;
+        }
+        let Some(camp) = ctx.campaign_idx.get(f(2)) else { return };
+        let ts = match ctx.tstab.parse(f(3)) {
+            Some(t) if t >= self.cws && t < ctx.we => t,
+            _ => return,
+        };
+        let cid = unsafe { self.pk.pack_clean(f0, clean) };
+        let uid = unsafe { self.pk.pack_clean(f1, clean) };
+        self.cm.prefetch_filter(uid);
+        unsafe { *self.pend.get_unchecked_mut(self.cur * PB + self.n) = (uid, ts, cid, camp) };
+        self.n += 1;
+        if self.n == PB {
+            self.rotate();
+        }
+    }
+
+    #[inline(never)]
+    fn rotate(&mut self) {
+        self.prefetch_half(self.cur, self.n);
+        self.process(self.cur ^ 1, self.prev_n);
+        self.prev_n = self.n;
+        self.cur ^= 1;
+        self.n = 0;
+    }
+
+    fn flush(&mut self) {
+        self.prefetch_half(self.cur, self.n);
+        self.process(self.cur ^ 1, self.prev_n);
+        self.process(self.cur, self.n);
+        self.prev_n = 0;
+        self.n = 0;
+    }
+
+    #[inline(always)]
+    fn prefetch_half(&mut self, h: usize, n: usize) {
+        let cm = self.cm;
+        for i in h * PB..h * PB + n {
+            let uid = self.pend[i].0;
+            let m = cm.maybe(uid);
+            self.linked[i] = m;
+            if m {
+                cm.prefetch_slot(uid);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, h: usize, n: usize) {
+        let (cm, parts) = (self.cm, self.parts);
+        for i in h * PB..h * PB + n {
+            let (uid, ts, cid, camp) = self.pend[i];
+            let person = if self.linked[i] { cm.get_linked(uid) } else { uid };
+            self.ck.push(parts.by_person(person), Ck { person, ts, cid, camp });
+        }
+    }
+}
+
+/// Click lines of file[start..end] into `sink`: lines under 64 bytes (nearly all) are
+/// split from two 32-byte masks; others take the 128-byte window or the scalar split.
+#[inline(always)]
+fn scan_clicks2<P: Packer>(file: &[u8], start: usize, end: usize, check: bool, sink: &mut CkSink<P>) {
+    let mut pos = start;
+    let fast_end = file.len().saturating_sub(scan::FAST_SLACK);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut p = [0usize; 4];
+    while pos < end {
+        if pos <= fast_end {
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST));
+            let base = unsafe { file.as_ptr().add(pos) };
+            let [nlo, clo, qlo, blo] = unsafe { scan::masks64(base) };
+            let mut clean = false;
+            let (len, r) = if nlo != 0 {
+                let len = nlo.trailing_zeros() as usize;
+                clean = blo & ((1u64 << len) - 1) == 0;
+                (len, scan::positions64::<4>(len, clo, qlo, &mut p))
+            } else {
+                let (nl, cm, qm) = unsafe { scan::masks128(base) };
+                if nl == 0 {
+                    (usize::MAX, None)
+                } else {
+                    let len = nl.trailing_zeros() as usize;
+                    (len, scan::positions::<4>(len, cm, qm, &mut p))
+                }
+            };
+            if len != usize::MAX {
+                if check {
+                    let line = &file[pos..pos + len];
+                    let mut o2: [&[u8]; 4] = [b""; 4];
+                    let ok2 = split::<4>(line, &mut o2);
+                    assert_eq!(r.is_some(), ok2, "splitters disagree on {:?}", String::from_utf8_lossy(line));
+                    if let Some(q) = r {
+                        for k in 0..4 {
+                            assert_eq!(scan::field::<4>(base, &p, q, k), o2[k], "field {k} of {:?}", String::from_utf8_lossy(line));
+                        }
+                    }
+                }
+                if let Some(quoted) = r {
+                    let mut fs = [(base, 0usize); 4];
+                    let mut s = 0usize;
+                    for k in 0..4 {
+                        let e = p[k];
+                        let qd = (unsafe { *base.add(s) } == b'"') as usize & quoted as usize;
+                        fs[k] = (unsafe { base.add(s + qd) }, e - s - 2 * qd);
+                        s = e + 1;
+                    }
+                    if check {
+                        for k in 0..2 {
+                            let fk = unsafe { std::slice::from_raw_parts(fs[k].0, fs[k].1) };
+                            assert_eq!(unsafe { sink.pk.pack_clean(fk, clean) }, unsafe { sink.pk.pack_padded(fk) });
+                        }
+                    }
+                    sink.line(&fs, clean);
+                }
+                pos += len + 1;
+                continue;
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[pos..end]).map_or(end, |i| pos + i);
+        buf.clear();
+        buf.extend_from_slice(&file[pos..e]);
+        buf.extend_from_slice(&[0u8; 16]);
+        let line = &buf[..e - pos];
+        let mut o: [&[u8]; 4] = [b""; 4];
+        if split::<4>(line, &mut o) {
+            sink.line(&o.map(|x| (x.as_ptr(), x.len())), false);
         }
         pos = e + 1;
     }
