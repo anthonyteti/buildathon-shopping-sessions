@@ -297,3 +297,93 @@ fn quotes_bad(len: usize, clo: u64, chi: u64, qlo: u64, qhi: u64) -> bool {
     let bad_hi = (qhi & !(starts_hi | ends_hi)) | (qhi & starts_hi & ends_hi) | (px_hi & seps_hi);
     (bad_lo | bad_hi) != 0
 }
+
+/// Masks of '\n', ',' and '"' over the 96 bytes at `p`, as 64-bit low halves (bytes
+/// 0..64) and 32-bit high halves (bytes 64..96): [nlo, nhi, clo, chi, qlo, qhi].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let vn = _mm256_set1_epi8(b'\n' as i8);
+        let vc = _mm256_set1_epi8(b',' as i8);
+        let vq = _mm256_set1_epi8(b'"' as i8);
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let v2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+        #[inline(always)]
+        unsafe fn m(v: __m256i, c: __m256i) -> u64 {
+            unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64 }
+        }
+        [
+            m(v0, vn) | m(v1, vn) << 32,
+            m(v2, vn),
+            m(v0, vc) | m(v1, vc) << 32,
+            m(v2, vc),
+            m(v0, vq) | m(v1, vq) << 32,
+            m(v2, vq),
+        ]
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub unsafe fn masks96(p: *const u8) -> [u64; 6] {
+    let (n, c, q) = unsafe { masks128(p) };
+    let h = |x: u128| (x >> 64) as u64 & 0xFFFF_FFFF;
+    [n as u64, h(n), c as u64, h(c), q as u64, h(q)]
+}
+
+#[inline(always)]
+fn bzhi(x: u64, n: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(x, n)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    if n >= 64 { x } else { x & ((1u64 << n) - 1) }
+}
+
+/// Position of the j-th (0-based) set bit of x (j < popcount(x)).
+#[inline(always)]
+fn select(x: u64, j: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pdep_u64(1u64 << j, x).trailing_zeros()
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = x;
+        for _ in 0..j {
+            x &= x - 1;
+        }
+        x.trailing_zeros()
+    }
+}
+
+/// `positions` for a line of 64 <= len < 96 bytes from `masks96` halves (high halves
+/// unmasked): separator positions of N fields, every position computed independently.
+#[inline(always)]
+pub fn positions96<const N: usize>(len: usize, clo: u64, chi: u64, qlo: u64, qhi: u64, pos: &mut [usize; N]) -> Option<bool> {
+    debug_assert!((64..96).contains(&len));
+    let h = (len - 64) as u32;
+    let chi = bzhi(chi, h);
+    let qhi = bzhi(qhi, h);
+    let nlo = clo.count_ones();
+    if (nlo + chi.count_ones()) as usize != N - 1 {
+        return None;
+    }
+    let quoted = (qlo | qhi) != 0;
+    if quotes_bad(len, clo, chi, qlo, qhi) {
+        return None;
+    }
+    for k in 0..N - 1 {
+        let k = k as u32;
+        let in_lo = k < nlo;
+        let src = if in_lo { clo } else { chi };
+        let j = if in_lo { k } else { k - nlo };
+        pos[k as usize] = (select(src, j) + if in_lo { 0 } else { 64 }) as usize;
+    }
+    pos[N - 1] = len;
+    Some(quoted)
+}

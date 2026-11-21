@@ -100,6 +100,23 @@ impl TsTab {
         self.parse(f).unwrap_or(i64::MAX)
     }
 
+    /// `ingest` in ms and its whole seconds (floor), without a division on the fast path.
+    #[inline(always)]
+    pub fn ingest_ms_s(&self, f: &[u8]) -> (i64, i64) {
+        if f.len() == 20 {
+            if let Some(days) = self.date(f) {
+                let t = u64::from_le_bytes(f[11..19].try_into().unwrap());
+                let v = t & 0x0F0F_0F0F_0F0F_0F0F;
+                let p = v * 10 + (v >> 8);
+                let (h, mi, s) = ((p & 0xFF) as i64, ((p >> 24) & 0xFF) as i64, ((p >> 48) & 0xFF) as i64);
+                let secs = days * 86_400 + (h * 60 + mi) * 60 + s;
+                return (secs * 1000, secs);
+            }
+        }
+        let ms = self.parse(f).unwrap_or(i64::MAX);
+        (ms, ms.div_euclid(1000))
+    }
+
     /// Same result as `parse_ts`.
     #[inline(always)]
     pub fn parse(&self, f: &[u8]) -> Option<i64> {

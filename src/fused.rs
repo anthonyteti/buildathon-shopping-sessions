@@ -297,96 +297,21 @@ pub fn run_fused<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             let tid = st.tid as u32;
             let mut buf = std::mem::take(&mut st.buf);
             if c.kind == 1 {
-                // valid events wait in a small batch while their person lookups are prefetched
-                const B: usize = 16;
-                type Pe = (u64, u64, u64, i64, u32, u16, bool);
-                let mut pend = [(0u64, 0u64, 0u64, 0i64, 0u32, 0u16, false); B];
-                let mut n = 0usize;
-                let flush = |pend: &[Pe], st: &mut PState| {
-                    for p in pend {
-                        cm.prefetch(p.2);
-                    }
-                    for &(eid, ing, uid, ts, price, cat, purchase) in pend {
-                        let person = cm.get(uid);
-                        let q = parts.by_person(person);
-                        let (kind, idx) = if purchase {
-                            let idx = st.se[q].len();
-                            st.se[q].push(Se { person, ts, price, cat, purchase: true });
-                            (1u32, idx)
-                        } else {
-                            let idx = st.sv.len(q);
-                            st.sv.push(q, Sv { person, ts });
-                            (0u32, idx)
-                        };
-                        if idx >> IDX_BITS != 0 {
-                            st.bad = true;
-                        }
-                        let loc = tid << 28 | kind << 27 | (q as u32) << IDX_BITS | idx as u32 & ((1 << IDX_BITS) - 1);
-                        st.er.push(parts.by_eid(eid), Er { eid, x: ing << 32 | loc as u64 });
-                    }
+                let mut sink = EvSink {
+                    ctx,
+                    pk,
+                    cm: &cm,
+                    parts,
+                    ws_s,
+                    tid,
+                    st,
+                    pend: [(0u64, 0u64, 0u64, 0i64, 0u32, 0u16, false); PB],
+                    n: 0,
                 };
                 with_chunk(&ctx.events[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
-                    scan_events(data, start, end, check, |fl| {
-                        let f = |k: usize| fl.get(k);
-                        let f0 = f(0);
-                        if f0.is_empty() {
-                            return;
-                        }
-                        let eid = unsafe { pk.pack_padded(f0) };
-                        let ingest = ctx.tstab.ingest(f(3));
-                        let ing_rel = ingest.div_euclid(1000) - ws_s;
-                        if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
-                            st.bad = true;
-                        }
-                        let ing = ing_rel as i32 as u32 as u64;
-                        'v: {
-                            let f1 = f(1);
-                            let f5 = f(5);
-                            if f1.is_empty() || f5.is_empty() {
-                                break 'v;
-                            }
-                            let ts = match ctx.tstab.parse(f(2)) {
-                                Some(t) if t >= ws && t < we => t,
-                                _ => break 'v,
-                            };
-                            let t = f(4);
-                            let w = u64::from_le(unsafe { (t.as_ptr() as *const u64).read_unaligned() });
-                            let purchase = if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") {
-                                true
-                            } else if t.len() == 4
-                                && ((w as u32) == u32::from_le_bytes(*b"view") || (w as u32) == u32::from_le_bytes(*b"cart"))
-                            {
-                                false
-                            } else {
-                                break 'v;
-                            };
-                            let mut price = 0u32;
-                            let mut cat = 0u16;
-                            if purchase {
-                                match parse_price(f(6)) {
-                                    Some(p) => price = p,
-                                    None => break 'v,
-                                }
-                                cat = ctx.product_idx.get(f5).unwrap_or(ctx.unknown_cat);
-                            }
-                            if ingest.saturating_sub(ts) > DAY {
-                                break 'v;
-                            }
-                            let uid = unsafe { pk.pack_padded(f1) };
-                            cm.prefetch_filter(uid);
-                            pend[n] = (eid, ing, uid, ts, price, cat, purchase);
-                            n += 1;
-                            if n == B {
-                                flush(&pend, st);
-                                n = 0;
-                            }
-                            return;
-                        }
-                        // an invalid copy still counts for the dedup
-                        st.er.push(parts.by_eid(eid), Er { eid, x: ing << 32 | NONE as u64 });
-                    });
+                    scan_events2(data, start, end, check, &mut sink);
                 });
-                flush(&pend[..n], st);
+                sink.flush();
             } else {
                 const B: usize = 16;
                 let mut pend = [(0u64, 0i64, 0u64, 0u16); B];
@@ -648,4 +573,189 @@ fn lid_of(g: &mut Group, mask: usize, limit: usize, person: u64) -> u32 {
     };
     g.off[l as usize] += 1;
     l
+}
+
+const PB: usize = 16;
+/// A valid event waiting for its person lookup: (eid, ingest, uid, ts, price, cat, purchase).
+type Pe = (u64, u64, u64, i64, u32, u16, bool);
+
+/// Decodes event lines and routes them: valid events wait in a small batch while their
+/// person lookups are prefetched; every copy leaves a dedup record.
+struct EvSink<'a, P: Packer> {
+    ctx: &'a Ctx,
+    pk: &'a P,
+    cm: &'a CMap,
+    parts: Parts,
+    ws_s: i64,
+    tid: u32,
+    st: &'a mut PState,
+    pend: [Pe; PB],
+    n: usize,
+}
+
+impl<'a, P: Packer> EvSink<'a, P> {
+    /// One well-formed line; `fs[k]` is field k (quotes stripped, 16 readable bytes).
+    #[inline(always)]
+    fn line(&mut self, fs: &[(*const u8, usize); 7]) {
+        let f = |k: usize| unsafe { std::slice::from_raw_parts(fs[k].0, fs[k].1) };
+        let ctx = self.ctx;
+        let pk = self.pk;
+        let (ws, we) = (ctx.ws, ctx.we);
+        let f0 = f(0);
+        if f0.is_empty() {
+            return;
+        }
+        let eid = unsafe { pk.pack_padded(f0) };
+        let (ingest, ing_s) = ctx.tstab.ingest_ms_s(f(3));
+        let ing_rel = ing_s - self.ws_s;
+        if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
+            self.st.bad = true;
+        }
+        let ing = ing_rel as i32 as u32 as u64;
+        'v: {
+            let f1 = f(1);
+            let f5 = f(5);
+            if f1.is_empty() || f5.is_empty() {
+                break 'v;
+            }
+            let ts = match ctx.tstab.parse(f(2)) {
+                Some(t) if t >= ws && t < we => t,
+                _ => break 'v,
+            };
+            let t = f(4);
+            let w = u64::from_le(unsafe { (t.as_ptr() as *const u64).read_unaligned() });
+            let purchase = if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") {
+                true
+            } else if t.len() == 4
+                && ((w as u32) == u32::from_le_bytes(*b"view") || (w as u32) == u32::from_le_bytes(*b"cart"))
+            {
+                false
+            } else {
+                break 'v;
+            };
+            let mut price = 0u32;
+            let mut cat = 0u16;
+            if purchase {
+                match parse_price(f(6)) {
+                    Some(p) => price = p,
+                    None => break 'v,
+                }
+                cat = ctx.product_idx.get(f5).unwrap_or(ctx.unknown_cat);
+            }
+            if ingest.saturating_sub(ts) > DAY {
+                break 'v;
+            }
+            let uid = unsafe { pk.pack_padded(f1) };
+            self.cm.prefetch_filter(uid);
+            unsafe { *self.pend.get_unchecked_mut(self.n) = (eid, ing, uid, ts, price, cat, purchase) };
+            self.n += 1;
+            if self.n == PB {
+                self.flush();
+            }
+            return;
+        }
+        // an invalid copy still counts for the dedup
+        self.st.er.push(self.parts.by_eid(eid), Er { eid, x: ing << 32 | NONE as u64 });
+    }
+
+    #[inline(never)]
+    fn flush(&mut self) {
+        let (cm, parts, tid) = (self.cm, self.parts, self.tid);
+        let pend = &self.pend[..self.n];
+        let st = &mut *self.st;
+        for p in pend {
+            cm.prefetch(p.2);
+        }
+        for &(eid, ing, uid, ts, price, cat, purchase) in pend {
+            let person = cm.get(uid);
+            let q = parts.by_person(person);
+            let (kind, idx) = if purchase {
+                let idx = st.se[q].len();
+                st.se[q].push(Se { person, ts, price, cat, purchase: true });
+                (1u32, idx)
+            } else {
+                let idx = st.sv.len(q);
+                st.sv.push(q, Sv { person, ts });
+                (0u32, idx)
+            };
+            if idx >> IDX_BITS != 0 {
+                st.bad = true;
+            }
+            let loc = tid << 28 | kind << 27 | (q as u32) << IDX_BITS | idx as u32 & ((1 << IDX_BITS) - 1);
+            st.er.push(parts.by_eid(eid), Er { eid, x: ing << 32 | loc as u64 });
+        }
+        self.n = 0;
+    }
+}
+
+/// Event lines of file[start..end] into `sink`. Lines of 64..96 bytes (nearly all) take
+/// `positions96`; shorter or longer ones the 128-byte window; the rest the scalar split.
+/// With `check`, every fast-path line is also split by `split` and compared.
+#[inline(always)]
+fn scan_events2<P: Packer>(file: &[u8], start: usize, end: usize, check: bool, sink: &mut EvSink<P>) {
+    let mut pos = start;
+    let fast_end = file.len().saturating_sub(scan::FAST_SLACK);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut p = [0usize; 7];
+    while pos < end {
+        if pos <= fast_end {
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST));
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST + 64));
+            let base = unsafe { file.as_ptr().add(pos) };
+            let [nlo, nhi, clo, chi, qlo, qhi] = unsafe { scan::masks96(base) };
+            let (len, r) = if nlo == 0 && nhi != 0 {
+                let len = 64 + nhi.trailing_zeros() as usize;
+                (len, scan::positions96::<7>(len, clo, chi, qlo, qhi, &mut p))
+            } else if nlo != 0 {
+                let len = nlo.trailing_zeros() as usize;
+                let cm = clo as u128 | (chi as u128) << 64;
+                let qm = qlo as u128 | (qhi as u128) << 64;
+                (len, scan::positions::<7>(len, cm, qm, &mut p))
+            } else {
+                let (nl, cm, qm) = unsafe { scan::masks128(base) };
+                if nl == 0 {
+                    (usize::MAX, None)
+                } else {
+                    let len = nl.trailing_zeros() as usize;
+                    (len, scan::positions::<7>(len, cm, qm, &mut p))
+                }
+            };
+            if len != usize::MAX {
+                if check {
+                    let line = &file[pos..pos + len];
+                    let mut o2: [&[u8]; 7] = [b""; 7];
+                    let ok2 = split::<7>(line, &mut o2);
+                    assert_eq!(r.is_some(), ok2, "splitters disagree on {:?}", String::from_utf8_lossy(line));
+                    if let Some(q) = r {
+                        for k in 0..7 {
+                            assert_eq!(scan::field::<7>(base, &p, q, k), o2[k], "field {k} of {:?}", String::from_utf8_lossy(line));
+                        }
+                    }
+                }
+                if let Some(quoted) = r {
+                    let mut fs = [(base, 0usize); 7];
+                    let mut s = 0usize;
+                    for k in 0..7 {
+                        let e = p[k];
+                        let qd = (unsafe { *base.add(s) } == b'"') as usize & quoted as usize;
+                        fs[k] = (unsafe { base.add(s + qd) }, e - s - 2 * qd);
+                        s = e + 1;
+                    }
+                    sink.line(&fs);
+                }
+                pos += len + 1;
+                continue;
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[pos..end]).map_or(end, |i| pos + i);
+        buf.clear();
+        buf.extend_from_slice(&file[pos..e]);
+        buf.extend_from_slice(&[0u8; 16]);
+        let line = &buf[..e - pos];
+        let mut o: [&[u8]; 7] = [b""; 7];
+        if split::<7>(line, &mut o) {
+            sink.line(&o.map(|x| (x.as_ptr(), x.len())));
+        }
+        pos = e + 1;
+    }
 }
