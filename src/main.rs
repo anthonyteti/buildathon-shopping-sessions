@@ -702,7 +702,8 @@ pub struct UdRow {
 
 #[derive(Clone, Copy)]
 struct Parts {
-    bits: u32,
+    bits: u32,  // event_id partitions
+    pbits: u32, // person partitions
 }
 impl Parts {
     #[inline(always)]
@@ -714,8 +715,12 @@ impl Parts {
         (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize
     }
     #[inline(always)]
+    fn np(self) -> usize {
+        1 << self.pbits
+    }
+    #[inline(always)]
     fn by_person(self, k: u64) -> usize {
-        (k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) >> (64 - self.bits)) as usize
+        (k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) >> (64 - self.pbits)) as usize
     }
 }
 
@@ -987,10 +992,12 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     while bits < 11 && (est_events >> bits) > 16_384 {
         bits += 1;
     }
-    let parts = Parts { bits };
+    let pdelta: u32 = std::env::var("SS_PDELTA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let parts = Parts { bits, pbits: bits.saturating_sub(pdelta).max(4) };
     let np = parts.n();
+    let npp = parts.np();
     let ev_res = est_events * 6 / 5 / (nt * np) + 8;
-    let ck_res = (ck_bytes / 45) * 6 / 5 / (nt * np) + 8;
+    let ck_res = (ck_bytes / 45) * 6 / 5 / (nt * npp) + 8;
     let mut items = vec![Chunk { kind: 3, file: 0, start: 0, end: 0 }];
     let mut evc = Vec::new();
     make_chunks(&ctx.events, 1, 8 << 20, &mut evc);
@@ -1007,7 +1014,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         items.len(),
         || ParseState {
             ev: (0..np).map(|_| Vec::with_capacity(ev_res)).collect(),
-            ck: (0..np).map(|_| Vec::with_capacity(ck_res)).collect(),
+            ck: (0..npp).map(|_| Vec::with_capacity(ck_res)).collect(),
             buf: Vec::new(),
         },
         |st, i| {
@@ -1115,11 +1122,11 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let persons = persons.get().expect("person map");
 
     // ---- dedup per event_id partition: keep the copy with the smallest ingest_ts
-    let se_res = est_events * 6 / 5 / (nt * np) + 8;
+    let se_res = est_events * 6 / 5 / (nt * npp) + 8;
     let deduped: Vec<DedupState> = par_run(
         nt,
         np,
-        || DedupState { out: (0..np).map(|_| Vec::with_capacity(se_res)).collect(), table: Vec::new(), surv: Vec::new() },
+        || DedupState { out: (0..npp).map(|_| Vec::with_capacity(se_res)).collect(), table: Vec::new(), surv: Vec::new() },
         |st, p| {
             let total: usize = parsed.iter().map(|s| s.ev[p].len()).sum();
             let cap = (total + total / 2).next_power_of_two().max(16);
@@ -1184,11 +1191,11 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let organic = ncamp as u16;
     let ncat = ctx.cat_names.len();
     let mut order: Vec<(usize, usize)> =
-        (0..np).map(|q| (deduped.iter().map(|d| d.out[q].len()).sum::<usize>(), q)).collect();
+        (0..npp).map(|q| (deduped.iter().map(|d| d.out[q].len()).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let aggs: Vec<AggState> = par_run(
         nt,
-        np,
+        npp,
         || AggState {
             rows: Vec::new(),
             camp: vec![0; (ncamp + 1) * ndays * 4],
