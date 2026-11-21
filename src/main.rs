@@ -683,6 +683,32 @@ struct Se {
     purchase: bool,
 }
 
+/// An event inside a grouped person slice (the person is the slice's): 16 bytes.
+/// pc = price | category << 32 | purchase << 48.
+#[derive(Clone, Copy)]
+struct Ev2 {
+    ts: i64,
+    pc: u64,
+}
+impl Ev2 {
+    #[inline(always)]
+    fn of(e: &Se) -> Ev2 {
+        Ev2 { ts: e.ts, pc: e.price as u64 | (e.cat as u64) << 32 | (e.purchase as u64) << 48 }
+    }
+    #[inline(always)]
+    fn purchase(&self) -> bool {
+        self.pc >> 48 != 0
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.pc as u32
+    }
+    #[inline(always)]
+    fn cat(&self) -> u16 {
+        (self.pc >> 32) as u16
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Ck {
     person: u64,
@@ -756,7 +782,8 @@ struct Group {
     lid: Vec<u32>,
     off: Vec<u32>,
     pos: Vec<u32>,
-    evs: Vec<Se>,
+    evs: Vec<Ev2>,
+    pkey: Vec<u64>,
     coff: Vec<u32>,
     clid: Vec<u32>,
     cks: Vec<Ck>,
@@ -815,12 +842,15 @@ fn group_partition<'a>(
     g.pos.clear();
     g.pos.extend_from_slice(&g.off[..nl]);
     g.evs.clear();
-    g.evs.resize(n, Se { person: 0, ts: 0, price: 0, cat: 0, purchase: false });
+    g.evs.resize(n, Ev2 { ts: 0, pc: 0 });
+    g.pkey.clear();
+    g.pkey.resize(nl, 0);
     let mut k = 0;
     for part in evs_in {
         for e in part {
             let l = g.lid[k] as usize;
-            g.evs[g.pos[l] as usize] = *e;
+            g.evs[g.pos[l] as usize] = Ev2::of(e);
+            g.pkey[l] = e.person;
             g.pos[l] += 1;
             k += 1;
         }
@@ -1213,8 +1243,9 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), parsed.iter().map(|s| s.ck[q].as_slice()));
             for l in 0..g.off.len() - 1 {
                 let ev = &g.evs[g.off[l] as usize..g.off[l + 1] as usize];
+                let person = g.pkey[l];
                 let ck = &g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
-                person_sessions(st, ev[0].person, ev, ck, day0, ndays, organic);
+                person_sessions(st, person, ev, ck, day0, ndays, organic);
             }
             st.g = g;
         },
@@ -1262,7 +1293,7 @@ fn cslot(camp: usize, day: usize, ndays: usize) -> usize {
     (camp * ndays + day) * 4
 }
 
-fn person_sessions(st: &mut AggState, person: u64, evs: &[Se], cks: &[Ck], day0: i64, ndays: usize, organic: u16) {
+fn person_sessions(st: &mut AggState, person: u64, evs: &[Ev2], cks: &[Ck], day0: i64, ndays: usize, organic: u16) {
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut cur_day: i64 = i64::MIN;
     let (mut u_sess, mut u_events, mut u_rev) = (0i32, 0i32, 0i64);
@@ -1285,14 +1316,14 @@ fn person_sessions(st: &mut AggState, person: u64, evs: &[Se], cks: &[Ck], day0:
         while m < evs.len() && evs[m].ts - prev <= GAP {
             let e = evs[m];
             n += 1;
-            if e.purchase {
-                rev += e.price as i64;
+            if e.purchase() {
+                rev += e.price() as i64;
                 purch = true;
-                let c = e.cat as usize;
+                let c = e.cat() as usize;
                 if st.catsum[c] == 0 {
-                    st.touched.push(e.cat);
+                    st.touched.push(e.cat());
                 }
-                st.catsum[c] += e.price as i64;
+                st.catsum[c] += e.price() as i64;
             }
             prev = e.ts;
             m += 1;
