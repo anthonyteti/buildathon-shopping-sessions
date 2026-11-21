@@ -289,7 +289,7 @@ pub fn recover_keys(ctx: &Ctx) -> Option<Keys> {
     let nt = ctx.nthreads;
     let mut zu_all = Vec::new();
     let mut pairs = Vec::new(); // (z_e, z_u)
-    let (eb, el) = sample_rows::<7>(&ctx.events, 8, 6000, |f| {
+    let (eb, el) = sample_rows::<7>(&ctx.events, 6, 3000, |f| {
         let zu = zfield(f[1], b'u');
         if let Some(z) = zu {
             zu_all.push(z);
@@ -321,7 +321,7 @@ pub fn recover_keys(ctx: &Ctx) -> Option<Keys> {
     let ke = mitm_retry(nt, &u0, te, 0, 0)?;
     // clicks of user 0
     let mut cu0 = Vec::new();
-    let (cb, cl) = sample_rows::<4>(&ctx.clicks, 8, 6000, |f| {
+    let (cb, cl) = sample_rows::<4>(&ctx.clicks, 6, 3000, |f| {
         if let (Some(zc), Some(zu)) = (zfield(f[0], b'k'), zfield(f[1], b'u')) {
             if unkey(zu, ku) >> 9 == 0 {
                 cu0.push(zc);
@@ -458,125 +458,14 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let (ke, ku, kc) = (keys.e, keys.u, keys.c);
     tlog(t0, "keys recovered");
 
-    // ---- links + parallel union-find (as in the fused pipeline)
-    let mut lchunks = Vec::new();
-    make_chunks(&ctx.links, 0, 4 << 20, &mut lchunks);
-    lchunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
-    let pairs: Vec<Vec<(u64, u64)>> = par_run(nt, lchunks.len(), Vec::new, |st: &mut Vec<(u64, u64)>, i| {
-        let c = lchunks[i];
-        scan_lines::<2>(&ctx.links[c.file as usize], c.start, c.end, check, |f| {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                let a = unsafe { pk.pack_padded(f[0]) };
-                let b = unsafe { pk.pack_padded(f[1]) };
-                if a != b {
-                    st.push((a, b));
-                }
-            }
-        });
-    });
-    if pk.failed() {
-        return None;
+    // ---- links: on their own phase (SS_LINKS_PAR=1), or by one worker while the others
+    // parse events and clicks (nothing in the parse needs persons)
+    let links_par = std::env::var_os("SS_LINKS_PAR").is_some();
+    let links_cell: std::sync::OnceLock<Option<(CMap, Vec<Ul>)>> = std::sync::OnceLock::new();
+    if links_par {
+        let _ = links_cell.set(build_links(ctx, pk, ku, check, nt));
+        tlog(t0, "links joined");
     }
-    let npairs: usize = pairs.iter().map(|v| v.len()).sum();
-    let cm = CMap::new(npairs);
-    let mut blocks = Vec::new();
-    for (vi, v) in pairs.iter().enumerate() {
-        let mut s = 0;
-        while s < v.len() {
-            let e = (s + 65536).min(v.len());
-            blocks.push((vi, s, e));
-            s = e;
-        }
-    }
-    par_run(nt, blocks.len(), || (), |_, bi| {
-        let (vi, s, e) = blocks[bi];
-        let v = &pairs[vi][s..e];
-        for (k, &(a, b)) in v.iter().enumerate() {
-            if k + 8 < v.len() {
-                let (a2, b2) = v[k + 8];
-                cm.prefetch_slot(a2);
-                cm.prefetch_slot(b2);
-            }
-            let ia = cm.slot(a);
-            let ib = cm.slot(b);
-            cm.union(ia, ib);
-        }
-    });
-    let cap = cm.t.len();
-    let nfin = (cap / 65536).max(1);
-    par_run(nt, nfin, || 0usize, |n, i| {
-        *n += cm.finish_range(i * cap / nfin, (i + 1) * cap / nfin);
-    });
-    // A person whose IDs inside the scheme do not all decode to one user index is handled
-    // by the slow path:
-    // flag bit 63 on the name of every member. Linked IDs inside the scheme also go into a
-    // table sorted by user index, which pass 2 walks in order (no hash lookups there).
-    let ust: Vec<AtomicU64> = zeroed_vec(cap);
-    let roots: Vec<AtomicU64> = zeroed_vec(cap); // root slot << 32 | x_u (u32::MAX: outside)
-    par_run(nt, nfin, || (), |_, i| {
-        for s in i * cap / nfin..(i + 1) * cap / nfin {
-            let k = cm.t[s][0].load(Relaxed);
-            if k == 0 {
-                continue;
-            }
-            let r = cm.find(s as u32) as usize;
-            let xu = xu_of_key(k, ku);
-            roots[s].store((r as u64) << 32 | xu as u64, Relaxed);
-            if xu == u32::MAX {
-                // outside the scheme: only matters if a row uses it (then that row's
-                // person is put in the slow set after placement)
-                continue;
-            }
-            let enc = (xu >> 9) as u64 + 1;
-            let mut cur = ust[r].load(Relaxed);
-            loop {
-                if cur == enc || cur == MULTI {
-                    break;
-                }
-                if cur == 0 {
-                    match ust[r].compare_exchange(0, enc, Relaxed, Relaxed) {
-                        Ok(_) => break,
-                        Err(x) => cur = x,
-                    }
-                } else {
-                    ust[r].store(MULTI, Relaxed);
-                    break;
-                }
-            }
-        }
-    });
-    let ul_parts: Vec<Vec<Ul>> = par_run(nt, nfin, Vec::new, |out, i| {
-        for s in i * cap / nfin..(i + 1) * cap / nfin {
-            let k = cm.t[s][0].load(Relaxed);
-            if k == 0 {
-                continue;
-            }
-            let rx = roots[s].load(Relaxed);
-            let (r, xu) = ((rx >> 32) as usize, rx as u32);
-            let multi = ust[r].load(Relaxed) == MULTI;
-            if multi {
-                // the flag must be seen for every member, including the root (whose name
-                // is itself, so `finish_range` left it out of the filter)
-                cm.t[s][1].fetch_or(1 << 63, Relaxed);
-                cm.set_filter(k);
-            }
-            if xu != u32::MAX {
-                let name = cm.t[s][1].load(Relaxed) & !(1u64 << 63);
-                out.push(Ul { u: xu >> 9, alias: xu & 511, name: name | (multi as u64) << 63 });
-            }
-        }
-    });
-    let mut ul: Vec<Ul> = Vec::with_capacity(ul_parts.iter().map(|v| v.len()).sum());
-    for v in &ul_parts {
-        ul.extend_from_slice(v);
-    }
-    if !ul.is_empty() {
-        let mut tmp = Vec::new();
-        radix_sort_u32(&mut ul, &mut tmp, |e| e.u);
-    }
-    drop(roots);
-    drop(ust);
-    tlog(t0, "links joined");
 
     // ---- parse events and clicks into dense-index partitions
     let ev_bytes: usize = ctx.events.iter().map(|m| m.len()).sum();
@@ -593,6 +482,9 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     make_chunks(&ctx.clicks, 2, 8 << 20, &mut ckc);
     items.extend(ckc);
     items.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    if !links_par {
+        items.insert(0, Chunk { kind: 3, file: 0, start: 0, end: 0 });
+    }
     let next_tid = AtomicUsize::new(0);
     let parsed: Vec<DState> = par_run(
         nt,
@@ -611,6 +503,10 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         },
         |st, i| {
             let c = items[i];
+            if c.kind == 3 {
+                let _ = links_cell.set(build_links(ctx, pk, ku, check, 1));
+                return;
+            }
             let mut buf = std::mem::take(&mut st.buf);
             if c.kind == 1 {
                 let mut sink = EvSink { ctx, pk, ke, ku, le, ws_s, st };
@@ -638,6 +534,7 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     if pk.failed() || parsed.iter().any(|s| s.bad) {
         return None;
     }
+    let (cm, ul) = links_cell.into_inner().flatten()?;
     let mut by_tid: Vec<usize> = vec![0; parsed.len()];
     for (i, s) in parsed.iter().enumerate() {
         by_tid[s.tid as usize] = i;
@@ -977,6 +874,127 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     write_output(ctx, pk, &aggs, ndays, day0);
     tlog(t0, "output written");
     Some(())
+}
+
+/// Links: parse, union-find, the multi-user flags and the table of linked IDs by user
+/// index, on `nt` threads.
+fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) -> Option<(CMap, Vec<Ul>)> {
+    // ---- links + parallel union-find (as in the fused pipeline)
+    let mut lchunks = Vec::new();
+    make_chunks(&ctx.links, 0, 4 << 20, &mut lchunks);
+    lchunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    let pairs: Vec<Vec<(u64, u64)>> = par_run(nt, lchunks.len(), Vec::new, |st: &mut Vec<(u64, u64)>, i| {
+        let c = lchunks[i];
+        scan_lines::<2>(&ctx.links[c.file as usize], c.start, c.end, check, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                let a = unsafe { pk.pack_padded(f[0]) };
+                let b = unsafe { pk.pack_padded(f[1]) };
+                if a != b {
+                    st.push((a, b));
+                }
+            }
+        });
+    });
+    let npairs: usize = pairs.iter().map(|v| v.len()).sum();
+    let cm = CMap::new(npairs);
+    let mut blocks = Vec::new();
+    for (vi, v) in pairs.iter().enumerate() {
+        let mut s = 0;
+        while s < v.len() {
+            let e = (s + 65536).min(v.len());
+            blocks.push((vi, s, e));
+            s = e;
+        }
+    }
+    par_run(nt, blocks.len(), || (), |_, bi| {
+        let (vi, s, e) = blocks[bi];
+        let v = &pairs[vi][s..e];
+        for (k, &(a, b)) in v.iter().enumerate() {
+            if k + 8 < v.len() {
+                let (a2, b2) = v[k + 8];
+                cm.prefetch_slot(a2);
+                cm.prefetch_slot(b2);
+            }
+            let ia = cm.slot(a);
+            let ib = cm.slot(b);
+            cm.union(ia, ib);
+        }
+    });
+    let cap = cm.t.len();
+    let nfin = (cap / 65536).max(1);
+    par_run(nt, nfin, || 0usize, |n, i| {
+        *n += cm.finish_range(i * cap / nfin, (i + 1) * cap / nfin);
+    });
+    // A person whose IDs inside the scheme do not all decode to one user index is handled
+    // by the slow path:
+    // flag bit 63 on the name of every member. Linked IDs inside the scheme also go into a
+    // table sorted by user index, which pass 2 walks in order (no hash lookups there).
+    let ust: Vec<AtomicU64> = zeroed_vec(cap);
+    let roots: Vec<AtomicU64> = zeroed_vec(cap); // root slot << 32 | x_u (u32::MAX: outside)
+    par_run(nt, nfin, || (), |_, i| {
+        for s in i * cap / nfin..(i + 1) * cap / nfin {
+            let k = cm.t[s][0].load(Relaxed);
+            if k == 0 {
+                continue;
+            }
+            let r = cm.find(s as u32) as usize;
+            let xu = xu_of_key(k, ku);
+            roots[s].store((r as u64) << 32 | xu as u64, Relaxed);
+            if xu == u32::MAX {
+                // outside the scheme: only matters if a row uses it (then that row's
+                // person is put in the slow set after placement)
+                continue;
+            }
+            let enc = (xu >> 9) as u64 + 1;
+            let mut cur = ust[r].load(Relaxed);
+            loop {
+                if cur == enc || cur == MULTI {
+                    break;
+                }
+                if cur == 0 {
+                    match ust[r].compare_exchange(0, enc, Relaxed, Relaxed) {
+                        Ok(_) => break,
+                        Err(x) => cur = x,
+                    }
+                } else {
+                    ust[r].store(MULTI, Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+    let ul_parts: Vec<Vec<Ul>> = par_run(nt, nfin, Vec::new, |out, i| {
+        for s in i * cap / nfin..(i + 1) * cap / nfin {
+            let k = cm.t[s][0].load(Relaxed);
+            if k == 0 {
+                continue;
+            }
+            let rx = roots[s].load(Relaxed);
+            let (r, xu) = ((rx >> 32) as usize, rx as u32);
+            let multi = ust[r].load(Relaxed) == MULTI;
+            if multi {
+                // the flag must be seen for every member, including the root (whose name
+                // is itself, so `finish_range` left it out of the filter)
+                cm.t[s][1].fetch_or(1 << 63, Relaxed);
+                cm.set_filter(k);
+            }
+            if xu != u32::MAX {
+                let name = cm.t[s][1].load(Relaxed) & !(1u64 << 63);
+                out.push(Ul { u: xu >> 9, alias: xu & 511, name: name | (multi as u64) << 63 });
+            }
+        }
+    });
+    let mut ul: Vec<Ul> = Vec::with_capacity(ul_parts.iter().map(|v| v.len()).sum());
+    for v in &ul_parts {
+        ul.extend_from_slice(v);
+    }
+    if !ul.is_empty() {
+        let mut tmp = Vec::new();
+        radix_sort_u32(&mut ul, &mut tmp, |e| e.u);
+    }
+    drop(roots);
+    drop(ust);
+    Some((cm, ul))
 }
 
 #[inline(always)]
