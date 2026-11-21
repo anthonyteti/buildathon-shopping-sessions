@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 const BIG: usize = 64 << 10;
 const RESERVE: usize = 1 << 37; // 128 GiB of address space, MAP_NORESERVE
 const ALIGN: usize = 64;
+/// Ask Linux for transparent huge pages on the arena.
+const HUGE_PAGES: bool = true;
 
 static BASE: AtomicUsize = AtomicUsize::new(0); // 0 = not set up yet, 1 = unavailable
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -34,8 +36,8 @@ fn base() -> usize {
         1
     } else {
         #[cfg(target_os = "linux")]
-        unsafe {
-            libc::madvise(p, RESERVE, libc::MADV_HUGEPAGE);
+        if HUGE_PAGES {
+            unsafe { libc::madvise(p, RESERVE, libc::MADV_HUGEPAGE) };
         }
         // start on a 2 MiB boundary
         ((p as usize) + (2 << 20) - 1) & !((2 << 20) - 1)
