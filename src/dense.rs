@@ -49,6 +49,12 @@ const EXO: u32 = 1 << 31;
 const MULTI: u64 = u64::MAX;
 const H8: u64 = 0x8080_8080_8080_8080;
 const ONES: u64 = 0x0101_0101_0101_0101;
+/// Slow-path person partitions.
+const NSP: usize = 256;
+#[inline(always)]
+fn hp(p: u64) -> usize {
+    (mix(p) >> 56) as usize
+}
 const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 #[inline(always)]
@@ -430,8 +436,8 @@ struct PlaceOut {
 
 #[derive(Default)]
 struct Pass2 {
-    slow_e: Vec<Se>,
-    slow_c: Vec<Ck>,
+    sp_e: Vec<Vec<Se>>, // slow-path records by person partition (hp)
+    sp_c: Vec<Vec<Ck>>,
     cache: Vec<(u64, bool)>, // (name, slow) per alias seen for the current user index
     aidx: Vec<(u32, u16)>,   // alias -> (stamp, cache index)
     stamp: u32,
@@ -828,38 +834,41 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         }
     });
     tlog(t0, &format!("sessions done (in place); slow path gets {} events, {} clicks; {} user indexes in several segments",
-        p2.iter().map(|x| x.1.slow_e.len()).sum::<usize>(), p2.iter().map(|x| x.1.slow_c.len()).sum::<usize>(),
+        p2.iter().flat_map(|x| x.1.sp_e.iter()).map(|v| v.len()).sum::<usize>(),
+        p2.iter().flat_map(|x| x.1.sp_c.iter()).map(|v| v.len()).sum::<usize>(),
         slow_u.iter().map(|w| w.count_ones() as usize).sum::<usize>()));
 
-    // ---- slow path: everything else, grouped by person name
-    let nsp = 64usize;
-    let mut sp_e: Vec<Vec<Se>> = (0..nsp).map(|_| Vec::new()).collect();
-    let mut sp_c: Vec<Vec<Ck>> = (0..nsp).map(|_| Vec::new()).collect();
-    let hp = |p: u64| (mix(p) >> 58) as usize;
-    let mut add = |e: &[Se], c: &[Ck]| {
+    // ---- slow path: everything else, grouped by person name. Pass 2 already split its
+    // records by person partition; the few from placement and the exotic IDs join here.
+    let mut sp0_e: Vec<Vec<Se>> = (0..NSP).map(|_| Vec::new()).collect();
+    let mut sp0_c: Vec<Vec<Ck>> = (0..NSP).map(|_| Vec::new()).collect();
+    for (e, c) in std::iter::once((&slow_e0, &slow_c0)).chain(placed.iter().map(|o| (&o.slow_e, &o.slow_c))) {
         for x in e {
-            sp_e[hp(x.person)].push(*x);
+            sp0_e[hp(x.person)].push(*x);
         }
         for x in c {
-            sp_c[hp(x.person)].push(*x);
+            sp0_c[hp(x.person)].push(*x);
         }
+    }
+    let sp0_e = &sp0_e;
+    let sp0_c = &sp0_c;
+    let p2r = &p2;
+    let part_e = move |q: usize| {
+        p2r.iter().map(move |x| x.1.sp_e.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_e[q].as_slice()))
     };
-    add(&slow_e0, &slow_c0);
-    for o in &placed {
-        add(&o.slow_e, &o.slow_c);
-    }
-    for (_, w) in &p2 {
-        add(&w.slow_e, &w.slow_c);
-    }
-    let sp_e = &sp_e;
-    let sp_c = &sp_c;
-    let slow_aggs: Vec<AggState> = par_run(nt, nsp, new_agg, |st, q| {
-        let n = sp_e[q].len();
+    let part_c = move |q: usize| {
+        p2r.iter().map(move |x| x.1.sp_c.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_c[q].as_slice()))
+    };
+    let mut sorder: Vec<(usize, usize)> = (0..NSP).map(|q| (part_e(q).map(|s| s.len()).sum::<usize>(), q)).collect();
+    sorder.sort_unstable_by(|a, b| b.cmp(a));
+    let sorder = &sorder;
+    let slow_aggs: Vec<AggState> = par_run(nt, NSP, new_agg, |st, k| {
+        let (n, q) = sorder[k];
         if n == 0 {
             return;
         }
         let mut g = std::mem::take(&mut st.g);
-        group_partition(&mut g, n, std::iter::empty::<&[Sv]>(), std::iter::once(sp_e[q].as_slice()), std::iter::once(sp_c[q].as_slice()));
+        group_partition(&mut g, n, std::iter::empty::<&[Sv]>(), part_e(q), part_c(q));
         for l in 0..g.off.len() - 1 {
             let ev = &g.evs[g.off[l] as usize..g.off[l + 1] as usize];
             let ck = &g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
@@ -1201,11 +1210,16 @@ fn person_out(
     organic: u16,
 ) {
     if slow {
+        if w.sp_e.is_empty() {
+            w.sp_e = (0..NSP).map(|_| Vec::new()).collect();
+            w.sp_c = (0..NSP).map(|_| Vec::new()).collect();
+        }
+        let q = hp(name);
         for e in evs.iter() {
-            w.slow_e.push(Se { person: name, ts: e.ts, price: e.price(), cat: e.cat(), purchase: e.purchase() });
+            w.sp_e[q].push(Se { person: name, ts: e.ts, price: e.price(), cat: e.cat(), purchase: e.purchase() });
         }
         for c in cks.iter() {
-            w.slow_c.push(Ck { person: name, cid: id_key(b'k', c.cid, kc), ..*c });
+            w.sp_c[q].push(Ck { person: name, cid: id_key(b'k', c.cid, kc), ..*c });
         }
         return;
     }
