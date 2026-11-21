@@ -8,7 +8,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN set -eu; \
-    if [ "$TARGETARCH" = "arm64" ]; then T=aarch64-unknown-linux-gnu; CPU=generic; \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then T=aarch64-unknown-linux-gnu; CPU=generic; \
     else T=x86_64-unknown-linux-gnu; CPU=x86-64-v3; fi; \
     RUSTFLAGS="-C target-cpu=$CPU -C target-feature=+crt-static" \
       cargo build --release --locked --target "$T" ${JOBS:+-j "$JOBS"}; \
