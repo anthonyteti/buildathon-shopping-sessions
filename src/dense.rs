@@ -1038,10 +1038,16 @@ fn links_join<P: Packer>(ctx: &Ctx, pk: &P, check: bool, nt: usize) -> CMap {
 /// index, and the names of persons whose IDs inside the scheme decode to more than one
 /// user index (those go to the slow path).
 fn links_table(cm: &CMap, ku: u64, nt: usize) -> (Vec<Ul>, Vec<u64>) {
-    const NB: usize = 64;
+    const NB: usize = 16; // name buckets for the multi-user check
+    const UB: u32 = 12; // the sort by user index: 1024 buckets of u >> 12 (u < 2^22)
     let cap = cm.t.len();
     let nfin = (cap / 65536).max(1);
-    let parts: Vec<(Vec<Ul>, Vec<Vec<(u64, u32)>>)> = par_run(nt, nfin, || (Vec::new(), vec![Vec::new(); NB]), |out, i| {
+    let parts: Vec<std::sync::Mutex<(Vec<Ul>, Vec<Vec<(u64, u32)>>, Vec<u32>)>> =
+        (0..nfin).map(|_| std::sync::Mutex::new((Vec::new(), Vec::new(), Vec::new()))).collect();
+    par_run(nt, nfin, || (), |_, i| {
+        let mut ul = Vec::new();
+        let mut nb: Vec<Vec<(u64, u32)>> = vec![Vec::new(); NB];
+        let mut hist = vec![0u32; 1 << (22 - UB)];
         for s in i * cap / nfin..(i + 1) * cap / nfin {
             let k = cm.t[s][0].load(Relaxed);
             if k == 0 {
@@ -1052,14 +1058,18 @@ fn links_table(cm: &CMap, ku: u64, nt: usize) -> (Vec<Ul>, Vec<u64>) {
                 continue; // outside the scheme: matters only if a row uses it (see placement)
             }
             let name = cm.t[s][1].load(Relaxed);
-            out.0.push(Ul { u: xu >> 9, alias: xu & 511, name });
-            out.1[(mix(name) >> 58) as usize].push((name, xu >> 9));
+            let u = xu >> 9;
+            ul.push(Ul { u, alias: xu & 511, name });
+            nb[(mix(name) >> 60) as usize].push((name, u));
+            hist[(u >> UB) as usize] += 1;
         }
+        *parts[i].lock().unwrap() = (ul, nb, hist);
     });
+    let parts: Vec<(Vec<Ul>, Vec<Vec<(u64, u32)>>, Vec<u32>)> = parts.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let parts = &parts;
     let multi: Vec<Vec<u64>> = par_run(nt, NB, Vec::new, |out, b| {
         let mut first: FxMap<u64, u32> = FxMap::default();
-        for (_, bk) in parts {
+        for (_, bk, _) in parts {
             for &(name, u) in &bk[b] {
                 match first.get_mut(&name) {
                     None => {
@@ -1075,14 +1085,39 @@ fn links_table(cm: &CMap, ku: u64, nt: usize) -> (Vec<Ul>, Vec<u64>) {
             }
         }
     });
-    let mut ul: Vec<Ul> = Vec::with_capacity(parts.iter().map(|v| v.0.len()).sum());
-    for v in parts {
-        ul.extend_from_slice(&v.0);
+    // counting sort by u >> UB in parallel, then each bucket sorted
+    let nbk = 1usize << (22 - UB);
+    let mut off = vec![0usize; nfin * nbk]; // [item][bucket] start
+    let mut bstart = vec![0usize; nbk + 1];
+    let mut acc = 0usize;
+    for b in 0..nbk {
+        bstart[b] = acc;
+        for (i, p) in parts.iter().enumerate() {
+            off[i * nbk + b] = acc;
+            acc += p.2[b] as usize;
+        }
     }
-    if !ul.is_empty() {
-        let mut tmp = Vec::new();
-        radix_sort_u32(&mut ul, &mut tmp, |e| e.u);
-    }
+    bstart[nbk] = acc;
+    let mut ul: Vec<Ul> = Vec::with_capacity(acc);
+    let up = ul.as_mut_ptr() as usize;
+    let off = &off;
+    par_run(nt, nfin, || (), |_, i| {
+        let mut o: Vec<usize> = off[i * nbk..(i + 1) * nbk].to_vec();
+        for e in &parts[i].0 {
+            let b = (e.u >> UB) as usize;
+            unsafe { (up as *mut Ul).add(o[b]).write(*e) };
+            o[b] += 1;
+        }
+    });
+    unsafe { ul.set_len(acc) };
+    let bstart = &bstart;
+    let nblk = 64usize;
+    par_run(nt, nblk, || (), |_, k| {
+        for b in k * nbk / nblk..(k + 1) * nbk / nblk {
+            let sl = unsafe { std::slice::from_raw_parts_mut((up as *mut Ul).add(bstart[b]), bstart[b + 1] - bstart[b]) };
+            sl.sort_unstable_by_key(|e| e.u);
+        }
+    });
     (ul, multi.into_iter().flatten().collect())
 }
 
