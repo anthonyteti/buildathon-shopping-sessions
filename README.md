@@ -1,0 +1,43 @@
+# Shopping Sessions
+
+A native implementation of the Buildathon "Shopping Sessions" track (Databricks): one statically linked Rust binary in an otherwise empty (`FROM scratch`) image. It reads `/data`, writes `/output/user_daily/` and `/output/campaign_daily/` as Parquet, and exits 0.
+
+## How it works
+
+1. **Setup.** Read `manifest.json`, `products.csv` and `campaigns.csv`. Memory-map every `*.csv` under `events/`, `clicks/` and `links/`, and cut each file into chunks at line boundaries (the first line of each file is its header).
+2. **Links.** Parse the link files in parallel, then run union-find over the distinct IDs. IDs are sorted first and every union keeps the smaller index as the root, so each root is the byte-wise smallest ID of its person: the person's name.
+3. **Events and clicks.** Parse all chunks in parallel with the exact CSV dialect (every comma splits; quotes only around a whole field; `\r` is data; ASCII digits only). Each event copy carries its own validity (user, timestamp form and window, type, product, price, late check) and its person. Event copies are scattered by `hash(event_id)`; valid clicks, already resolved to their person, by `hash(person)`.
+4. **Dedup.** Per event-id partition: sort by `(event_id, ingest_ts)`, keep the earliest copy, and drop the event if that copy is invalid. Surviving events are scattered by `hash(person)`.
+5. **Sessions and attribution.** Per person partition (largest first): sort events by `(person, ts)` and clicks by `(person, ts, click_id)`. Walk each person's events into sessions (a gap over 30 minutes splits). A sliding 7-day window over the person's clicks gives the credited click (latest `ts`, then smallest `click_id`) and the set of assisting campaigns in time linear in clicks plus distinct campaigns per session. Rows are aggregated per (person, day) and per (campaign, day).
+6. **Output.** Each worker writes its own `user_daily` Parquet file (PLAIN, uncompressed); one file holds `campaign_daily`. Empty tables are still written with their typed schema.
+
+**ID keys.** Every ID of 1 to 9 ASCII bytes is packed into a `u64` that keeps byte-wise order (7 bits per byte, big-endian, zero-padded), so equality, the smallest-ID person name and the `click_id` tie-break are plain integer comparisons. If any ID in the input does not fit (longer than 9 bytes, non-ASCII or NUL), the run is redone with keys that are ranks in the sorted set of all IDs, which is exact for any bytes. `SS_FORCE_RANK=1` forces that path for testing.
+
+## Build and run
+
+```sh
+docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+scripts/docker_run.sh DATA_DIR OUT_DIR           # scorer flags: read-only root, uid 1000, no network
+```
+
+Without Docker: `cargo build --release && target/release/sessions DATA_DIR OUT_DIR` (or set `DATA_DIR` and `OUTPUT_DIR`). `NCPU` sets the thread count. Phase timings go to stderr.
+
+## Tests
+
+```sh
+python3 scripts/run_fixtures.py fixtures -- target/release/sessions              # 36 edge-case fixtures
+python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh                # same, in the image
+python3 scripts/compare.py OUT_DIR dev-answer                                    # the published 1M dev answer
+```
+
+Beyond the fixtures and the dev answer, every change is checked against a plain-Python reference implementation of the rules on 60 generator seeds, on datasets with IDs rewritten to be long or non-ASCII (the fallback key path), and byte for byte against frozen 20M and 60M outputs.
+
+## Open-source code used
+
+- Rust crates: [`memchr`](https://github.com/BurntSushi/memchr) (MIT/Unlicense), [`memmap2`](https://github.com/RazrFalcon/memmap2-rs) (MIT/Apache-2.0) and [`parquet`](https://github.com/apache/arrow-rs) (Apache-2.0), plus their transitive dependencies as listed in `Cargo.lock`.
+- `fixtures/` and `scripts/` (`run_fixtures.py`, `compare.py`, `docker_run.sh`) are copied unchanged from the track's starter repository.
+- Base image for the build stage: the official `rust` Docker image.
+
+## License
+
+MIT, see `LICENSE`.
