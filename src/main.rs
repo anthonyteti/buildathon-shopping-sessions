@@ -1097,6 +1097,70 @@ fn scan_lines<const N: usize>(file: &[u8], start: usize, end: usize, check: bool
     }
 }
 
+/// Fields of one event line: cut lazily from separator positions (fast path) or
+/// already split (slow path).
+enum EvFields<'a> {
+    Fast { base: *const u8, p: [usize; 7], quoted: bool },
+    Slow([&'a [u8]; 7]),
+}
+impl<'a> EvFields<'a> {
+    #[inline(always)]
+    fn get(&self, k: usize) -> &'a [u8] {
+        match self {
+            EvFields::Fast { base, p, quoted } => scan::field::<7>(*base, p, *quoted, k),
+            EvFields::Slow(o) => o[k],
+        }
+    }
+}
+
+/// Event lines: like `scan_lines::<7>`, but `f` gets lazily cut fields. With `check`,
+/// every fast-path line is also split by `split` and compared.
+#[inline(always)]
+fn scan_events(file: &[u8], start: usize, end: usize, check: bool, mut f: impl FnMut(&EvFields)) {
+    let mut pos = start;
+    let fast_end = file.len().saturating_sub(scan::FAST_SLACK);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut p = [0usize; 7];
+    while pos < end {
+        if pos <= fast_end {
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST));
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST + 64));
+            let (nl, cm, qm) = unsafe { scan::masks128(file.as_ptr().add(pos)) };
+            if nl != 0 {
+                let len = nl.trailing_zeros() as usize;
+                let base = unsafe { file.as_ptr().add(pos) };
+                let r = scan::positions::<7>(len, cm, qm, &mut p);
+                if check {
+                    let line = &file[pos..pos + len];
+                    let mut o2: [&[u8]; 7] = [b""; 7];
+                    let ok2 = split::<7>(line, &mut o2);
+                    assert_eq!(r.is_some(), ok2, "splitters disagree on {:?}", String::from_utf8_lossy(line));
+                    if let Some(q) = r {
+                        for k in 0..7 {
+                            assert_eq!(scan::field::<7>(base, &p, q, k), o2[k], "field {k} of {:?}", String::from_utf8_lossy(line));
+                        }
+                    }
+                }
+                if let Some(quoted) = r {
+                    f(&EvFields::Fast { base, p, quoted });
+                }
+                pos += len + 1;
+                continue;
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[pos..end]).map_or(end, |i| pos + i);
+        buf.clear();
+        buf.extend_from_slice(&file[pos..e]);
+        buf.extend_from_slice(&[0u8; 16]);
+        let line = &buf[..e - pos];
+        let mut o: [&[u8]; 7] = [b""; 7];
+        if split::<7>(line, &mut o) {
+            f(&EvFields::Slow(o));
+        }
+        pos = e + 1;
+    }
+}
+
 const INGEST_OFF: i64 = 1 << 47;
 const PF_DIST: usize = 1024;
 
@@ -1168,24 +1232,28 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             } else if c.kind == 1 {
                 let mut buf = std::mem::take(&mut st.buf);
                 with_chunk(&ctx.events[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
-                scan_lines::<7>(data, start, end, check, |f| {
-                    if f[0].is_empty() {
+                scan_events(data, start, end, check, |fl| {
+                    let f = |k: usize| fl.get(k);
+                    let f0 = f(0);
+                    if f0.is_empty() {
                         return;
                     }
-                    let eid = unsafe { pk.pack_padded(f[0]) };
-                    let ingest = ctx.tstab.ingest(f[3]);
+                    let eid = unsafe { pk.pack_padded(f0) };
+                    let ingest = ctx.tstab.ingest(f(3));
                     let ing_s = (ingest.div_euclid(1000) - ws_s).clamp(-INGEST_OFF, INGEST_OFF - 1) + INGEST_OFF;
                     let mut rec = Ev { eid, uid: 0, meta: (ing_s as u64) << 16, tp: 0 };
                     'v: {
-                        if f[1].is_empty() || f[5].is_empty() {
+                        let f1 = f(1);
+                        let f5 = f(5);
+                        if f1.is_empty() || f5.is_empty() {
                             break 'v;
                         }
-                        let ts = match ctx.tstab.parse(f[2]) {
+                        let ts = match ctx.tstab.parse(f(2)) {
                             Some(t) if t >= ws && t < we => t,
                             _ => break 'v,
                         };
                         // event_type: compare whole words (fields have 16 readable bytes)
-                        let t = f[4];
+                        let t = f(4);
                         let w = u64::from_le(unsafe { (t.as_ptr() as *const u64).read_unaligned() });
                         let purchase = if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") {
                             true
@@ -1198,16 +1266,16 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         };
                         let mut price = 0u32;
                         if purchase {
-                            match parse_price(f[6]) {
+                            match parse_price(f(6)) {
                                 Some(p) => price = p,
                                 None => break 'v,
                             }
-                            rec.meta |= ctx.product_idx.get(f[5]).unwrap_or(ctx.unknown_cat) as u64;
+                            rec.meta |= ctx.product_idx.get(f5).unwrap_or(ctx.unknown_cat) as u64;
                         }
                         if ingest.saturating_sub(ts) > DAY {
                             break 'v;
                         }
-                        rec.uid = unsafe { pk.pack_padded(f[1]) };
+                        rec.uid = unsafe { pk.pack_padded(f1) };
                         rec.tp = ((ts - ws) as u64) << 26 | (price as u64) << 2 | 1 | if purchase { 2 } else { 0 };
                     }
                     st.ev.push(parts.by_eid(eid), rec);

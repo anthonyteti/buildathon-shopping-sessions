@@ -15,11 +15,18 @@ pub unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
         let vc = _mm256_set1_epi8(b',' as i8);
         let vq = _mm256_set1_epi8(b'"' as i8);
         let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
-        for i in 0..4 {
+        for i in 0..3 {
             let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
             n |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vn)) as u32 as u128) << (32 * i);
             c |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vc)) as u32 as u128) << (32 * i);
             q |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vq)) as u32 as u128) << (32 * i);
+        }
+        // most lines end within 96 bytes; the last 32 only when they do not
+        if n == 0 {
+            let v = _mm256_loadu_si256(p.add(96) as *const __m256i);
+            n |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vn)) as u32 as u128) << 96;
+            c |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vc)) as u32 as u128) << 96;
+            q |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vq)) as u32 as u128) << 96;
         }
         (n, c, q)
     }
@@ -215,4 +222,56 @@ fn fields64<'a, const N: usize>(line: &'a [u8], cm: u64, qm: u64, out: &mut [&'a
         s = e + 1;
     }
     true
+}
+
+/// Separator positions of a line of N fields (len < 128): pos[k] is the end of field k
+/// (pos[N-1] = len). Same validity rules as `fields`; fields are read with `field`.
+#[inline(always)]
+pub fn positions<const N: usize>(len: usize, cm: u128, qm: u128, pos: &mut [usize; N]) -> Option<bool> {
+    let (clo, chi, qlo, qhi) = if len < 64 {
+        let lm = (1u64 << len) - 1;
+        (cm as u64 & lm, 0u64, qm as u64 & lm, 0u64)
+    } else {
+        let mh = (1u64 << (len - 64)) - 1;
+        (cm as u64, (cm >> 64) as u64 & mh, qm as u64, (qm >> 64) as u64 & mh)
+    };
+    if (clo.count_ones() + chi.count_ones()) as usize != N - 1 {
+        return None;
+    }
+    let quoted = (qlo | qhi) != 0;
+    if quoted {
+        let c = clo as u128 | (chi as u128) << 64;
+        let q = qlo as u128 | (qhi as u128) << 64;
+        let seps = c | (1u128 << len);
+        let starts = (c << 1) | 1;
+        let ends = seps >> 1;
+        let bad = (q & !(starts | ends)) | (q & starts & ends) | (prefix_xor(q) & seps);
+        if bad != 0 {
+            return None;
+        }
+    }
+    let mut k = 0usize;
+    let mut x = clo;
+    while x != 0 {
+        unsafe { *pos.get_unchecked_mut(k) = x.trailing_zeros() as usize };
+        x &= x - 1;
+        k += 1;
+    }
+    let mut y = chi;
+    while y != 0 {
+        unsafe { *pos.get_unchecked_mut(k) = 64 + y.trailing_zeros() as usize };
+        y &= y - 1;
+        k += 1;
+    }
+    pos[N - 1] = len;
+    Some(quoted)
+}
+
+/// Field k of a line split by `positions` (quotes stripped when the line has any).
+#[inline(always)]
+pub fn field<'a, const N: usize>(base: *const u8, pos: &[usize; N], quoted: bool, k: usize) -> &'a [u8] {
+    let s = if k == 0 { 0 } else { pos[k - 1] + 1 };
+    let e = pos[k];
+    let qd = (quoted && unsafe { *base.add(s) } == b'"') as usize;
+    unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) }
 }
