@@ -15,6 +15,7 @@
 //! the whole run is redone with keys that are ranks in the sorted set of all IDs.
 
 mod arena;
+mod dense;
 mod fastpath;
 mod fused;
 mod parquet_out;
@@ -2023,12 +2024,27 @@ fn main() {
     // SS_FORCE_RANK=1 forces the fallback key path (used by the tests).
     let force_rank = std::env::var_os("SS_FORCE_RANK").is_some();
     let use_fused = std::env::var_os("SS_GENERAL").is_none();
-    let done = !force_rank && ((use_fused && fused::run_fused(&ctx, &p7, &t0).is_some()) || {
-        if use_fused {
-            eprintln!("outside the fast path's limits; running the general pipeline");
+    // SS_NO_DENSE=1 skips the dense-index path (generator ID scheme, checked at run time).
+    let use_dense = use_fused && std::env::var_os("SS_NO_DENSE").is_none();
+    let mut done = false;
+    if !force_rank {
+        if use_dense {
+            done = dense::run_dense(&ctx, &p7, &t0).is_some();
+            if !done {
+                eprintln!("input outside the dense-index path; trying the next pipeline");
+            }
         }
-        run(&ctx, &Pack7 { fail: AtomicBool::new(false) }, &t0).is_some()
-    });
+        // an ID that does not fit the packed key fails every packed-key pipeline alike
+        if !done && !p7.failed() && use_fused {
+            done = fused::run_fused(&ctx, &p7, &t0).is_some();
+            if !done {
+                eprintln!("outside the fast path's limits; running the general pipeline");
+            }
+        }
+        if !done && !p7.failed() {
+            done = run(&ctx, &Pack7 { fail: AtomicBool::new(false) }, &t0).is_some();
+        }
+    }
     if !done {
         eprintln!("an ID does not fit the packed key; rerunning with ranked keys");
         let rp = build_rank(&ctx);

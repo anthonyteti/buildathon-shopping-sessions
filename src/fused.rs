@@ -19,7 +19,7 @@ const PP_BITS: u32 = 9;
 
 /// A vector of n all-zero values (atomics here). Large ones come from the arena, whose
 /// fresh pages are zero, so nothing is written until first use (in parallel).
-fn zeroed_vec<T>(n: usize) -> Vec<T> {
+pub(crate) fn zeroed_vec<T>(n: usize) -> Vec<T> {
     let layout = std::alloc::Layout::array::<T>(n).unwrap();
     let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
     assert!(!p.is_null());
@@ -27,16 +27,16 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
 }
 
 /// Concurrent union-find over link IDs, then the ID -> person name map with a filter.
-struct CMap {
-    t: Vec<[AtomicU64; 2]>, // [key, name]
-    mask: usize,
+pub(crate) struct CMap {
+    pub(crate) t: Vec<[AtomicU64; 2]>, // [key, name]
+    pub(crate) mask: usize,
     parent: Vec<AtomicU32>, // parent slot + 1; 0 = root
     filt: Vec<AtomicU64>,
     fshift: u32,
 }
 
 impl CMap {
-    fn new(pairs: usize) -> CMap {
+    pub(crate) fn new(pairs: usize) -> CMap {
         // at most 2 IDs per pair: the load stays under 80%
         let cap = (pairs * 5 / 2).next_power_of_two().max(1024);
         let fbits = (cap * 4).next_power_of_two().max(4096);
@@ -49,12 +49,12 @@ impl CMap {
         }
     }
     #[inline(always)]
-    fn prefetch_slot(&self, k: u64) {
+    pub(crate) fn prefetch_slot(&self, k: u64) {
         prefetch(self.t.as_ptr().wrapping_add(mix(k) as usize & self.mask));
     }
     /// Slot of key k, inserting it if absent.
     #[inline(always)]
-    fn slot(&self, k: u64) -> u32 {
+    pub(crate) fn slot(&self, k: u64) -> u32 {
         let mut i = mix(k) as usize & self.mask;
         loop {
             let cur = self.t[i][0].load(Acquire);
@@ -73,7 +73,7 @@ impl CMap {
         }
     }
     #[inline(always)]
-    fn find(&self, mut x: u32) -> u32 {
+    pub(crate) fn find(&self, mut x: u32) -> u32 {
         loop {
             let p = self.parent[x as usize].load(Acquire);
             if p == 0 {
@@ -90,7 +90,7 @@ impl CMap {
         }
     }
     /// Joins two slots; the root of every set is the slot with the smallest key.
-    fn union(&self, a: u32, b: u32) {
+    pub(crate) fn union(&self, a: u32, b: u32) {
         loop {
             let ra = self.find(a);
             let rb = self.find(b);
@@ -107,7 +107,7 @@ impl CMap {
     }
     /// Stores every slot's person name and the filter bits (after all unions); returns
     /// how many IDs have a name other than themselves.
-    fn finish_range(&self, lo: usize, hi: usize) -> usize {
+    pub(crate) fn finish_range(&self, lo: usize, hi: usize) -> usize {
         let mut n = 0;
         for i in lo..hi {
             let k = self.t[i][0].load(Relaxed);
@@ -129,18 +129,23 @@ impl CMap {
     fn fpos(&self, k: u64) -> usize {
         (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> self.fshift) as usize
     }
+    /// Makes `maybe(k)` true (for keys whose stored name carries a flag).
+    pub(crate) fn set_filter(&self, k: u64) {
+        let b = self.fpos(k);
+        self.filt[b >> 6].fetch_or(1 << (b & 63), Relaxed);
+    }
     #[inline(always)]
-    fn maybe(&self, k: u64) -> bool {
+    pub(crate) fn maybe(&self, k: u64) -> bool {
         let b = self.fpos(k);
         unsafe { self.filt.get_unchecked(b >> 6) }.load(Relaxed) >> (b & 63) & 1 != 0
     }
     #[inline(always)]
-    fn prefetch_filter(&self, k: u64) {
+    pub(crate) fn prefetch_filter(&self, k: u64) {
         prefetch(self.filt.as_ptr().wrapping_add(self.fpos(k) >> 6));
     }
     /// Person name of an ID that passed the filter.
     #[inline(always)]
-    fn get_linked(&self, k: u64) -> u64 {
+    pub(crate) fn get_linked(&self, k: u64) -> u64 {
         let mut i = mix(k) as usize & self.mask;
         loop {
             let s = unsafe { self.t.get_unchecked(i) };
