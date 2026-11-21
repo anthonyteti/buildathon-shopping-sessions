@@ -380,6 +380,10 @@ impl PersonMap {
         }
     }
     #[inline(always)]
+    fn prefetch_filter(&self, k: u64) {
+        prefetch(self.filt.as_ptr().wrapping_add(self.fpos(k) >> 6));
+    }
+    #[inline(always)]
     fn prefetch(&self, k: u64) {
         if self.maybe(k) {
             prefetch(self.t.as_ptr().wrapping_add(mix(k) as usize & self.mask));
@@ -778,7 +782,7 @@ struct ParseState {
 struct DedupState {
     out: Vec<Vec<Sv>>,
     outp: Vec<Vec<Se>>,
-    table: Vec<[u64; 2]>,
+    table: Vec<Ev>,
     surv: Vec<Ev>,
 }
 
@@ -1247,22 +1251,21 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             let cap = (total + total / 2).next_power_of_two().max(16);
             let mask = cap - 1;
             st.table.clear();
-            st.table.resize(cap, [0, 0]);
+            st.table.resize(cap, Ev::default());
             let t = &mut st.table;
-            // entries: [event_id key, producer << 32 | index of the kept copy]
-            for (pi, s) in parsed.iter().enumerate() {
-                for (li, e) in s.ev.vecs[p].iter().enumerate() {
+            // whole records in the table (it stays in L2): the kept copy per event_id
+            for s in parsed.iter() {
+                for e in s.ev.vecs[p].iter() {
                     let mut i = (mix(e.eid) as usize) & mask;
                     loop {
                         let x = unsafe { t.get_unchecked_mut(i) };
-                        if x[0] == 0 {
-                            *x = [e.eid, (pi as u64) << 32 | li as u64];
+                        if x.eid == 0 {
+                            *x = *e;
                             break;
                         }
-                        if x[0] == e.eid {
-                            let cur = &parsed[(x[1] >> 32) as usize].ev.vecs[p][(x[1] & 0xffff_ffff) as usize];
-                            if (e.meta >> 16) < (cur.meta >> 16) {
-                                x[1] = (pi as u64) << 32 | li as u64;
+                        if x.eid == e.eid {
+                            if (e.meta >> 16) < (x.meta >> 16) {
+                                *x = *e;
                             }
                             break;
                         }
@@ -1272,18 +1275,20 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             }
             st.surv.clear();
             for x in t.iter() {
-                if x[0] != 0 {
-                    let e = unsafe { parsed.get_unchecked((x[1] >> 32) as usize).ev.vecs.get_unchecked(p).get_unchecked((x[1] & 0xffff_ffff) as usize) };
-                    if e.tp & 1 != 0 {
-                        st.surv.push(*e);
-                    }
+                if x.tp & 1 != 0 {
+                    st.surv.push(*x);
                 }
             }
-            const D: usize = 8;
+            // two-stage prefetch: the filter word far ahead, the table slot nearer
+            const D1: usize = 16;
+            const D2: usize = 6;
             let surv = &st.surv;
             for i in 0..surv.len() {
-                if i + D < surv.len() {
-                    persons.prefetch(surv[i + D].uid);
+                if i + D1 < surv.len() {
+                    persons.prefetch_filter(surv[i + D1].uid);
+                }
+                if i + D2 < surv.len() {
+                    persons.prefetch(surv[i + D2].uid);
                 }
                 let e = surv[i];
                 let person = persons.get(e.uid);
