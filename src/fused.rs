@@ -17,6 +17,15 @@ const NONE: u32 = u32::MAX;
 const IDX_BITS: u32 = 18;
 const PP_BITS: u32 = 9;
 
+/// A vector of n all-zero values (atomics here). Large ones come from the arena, whose
+/// fresh pages are zero, so nothing is written until first use (in parallel).
+fn zeroed_vec<T>(n: usize) -> Vec<T> {
+    let layout = std::alloc::Layout::array::<T>(n).unwrap();
+    let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
+    assert!(!p.is_null());
+    unsafe { Vec::from_raw_parts(p, n, n) }
+}
+
 /// Concurrent union-find over link IDs, then the ID -> person name map with a filter.
 struct CMap {
     t: Vec<[AtomicU64; 2]>, // [key, name]
@@ -28,13 +37,14 @@ struct CMap {
 
 impl CMap {
     fn new(pairs: usize) -> CMap {
-        let cap = (pairs * 3).next_power_of_two().max(1024);
+        // at most 2 IDs per pair: the load stays under 80%
+        let cap = (pairs * 5 / 2).next_power_of_two().max(1024);
         let fbits = (cap * 4).next_power_of_two().max(4096);
         CMap {
-            t: (0..cap).map(|_| [AtomicU64::new(0), AtomicU64::new(0)]).collect(),
+            t: zeroed_vec(cap),
             mask: cap - 1,
-            parent: (0..cap).map(|_| AtomicU32::new(0)).collect(),
-            filt: (0..fbits / 64).map(|_| AtomicU64::new(0)).collect(),
+            parent: zeroed_vec(cap),
+            filt: zeroed_vec(fbits / 64),
             fshift: 64 - fbits.trailing_zeros(),
         }
     }
