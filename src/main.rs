@@ -683,6 +683,13 @@ struct Se {
     purchase: bool,
 }
 
+/// A surviving view or cart event (no price): 16 bytes.
+#[derive(Clone, Copy)]
+struct Sv {
+    person: u64,
+    ts: i64,
+}
+
 /// An event inside a grouped person slice (the person is the slice's): 16 bytes.
 /// pc = price | category << 32 | purchase << 48.
 #[derive(Clone, Copy)]
@@ -757,7 +764,8 @@ struct ParseState {
 }
 
 struct DedupState {
-    out: Vec<Vec<Se>>,
+    out: Vec<Vec<Sv>>,
+    outp: Vec<Vec<Se>>,
     table: Vec<[u64; 2]>,
     surv: Vec<Ev>,
 }
@@ -789,47 +797,96 @@ struct Group {
     cks: Vec<Ck>,
 }
 
+/// A record that can be grouped by person.
+trait PersonRec: Copy {
+    fn person(&self) -> u64;
+    fn ev2(&self) -> Ev2;
+}
+impl PersonRec for Se {
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn ev2(&self) -> Ev2 {
+        Ev2::of(self)
+    }
+}
+impl PersonRec for Sv {
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn ev2(&self) -> Ev2 {
+        Ev2 { ts: self.ts, pc: 0 }
+    }
+}
+
+/// Assigns local person ids; false if the table filled up.
+#[inline(always)]
+fn assign_lids<'a, R: PersonRec + 'a>(g: &mut Group, mask: usize, limit: usize, parts: impl Iterator<Item = &'a [R]>) -> bool {
+    for part in parts {
+        for e in part {
+            let person = e.person();
+            let mut i = mix(person) as usize & mask;
+            let l = loop {
+                let s = unsafe { *g.tab.get_unchecked(i) };
+                if s.0 == person {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    let l = g.off.len() as u32;
+                    if l as usize >= limit {
+                        return false;
+                    }
+                    g.tab[i] = (person, l);
+                    g.off.push(0);
+                    break l;
+                }
+                i = (i + 1) & mask;
+            };
+            g.off[l as usize] += 1;
+            g.lid.push(l);
+        }
+    }
+    true
+}
+
+#[inline(always)]
+fn scatter_lids<'a, R: PersonRec + 'a>(g: &mut Group, k: &mut usize, parts: impl Iterator<Item = &'a [R]>) {
+    for part in parts {
+        for e in part {
+            let l = g.lid[*k] as usize;
+            g.evs[g.pos[l] as usize] = e.ev2();
+            g.pkey[l] = e.person();
+            g.pos[l] += 1;
+            *k += 1;
+        }
+    }
+}
+
 fn group_partition<'a>(
     g: &mut Group,
     n: usize,
-    evs_in: impl Iterator<Item = &'a [Se]> + Clone,
+    plain_in: impl Iterator<Item = &'a [Sv]> + Clone,
+    pur_in: impl Iterator<Item = &'a [Se]> + Clone,
     cks_in: impl Iterator<Item = &'a [Ck]> + Clone,
 ) {
     // local person ids; the table starts small (persons are far fewer than events)
     // and is rebuilt larger if it fills up
     let mut cap = (n / 4).next_power_of_two().max(64);
-    let mask = 'build: loop {
+    let mask = loop {
         let mask = cap - 1;
         let limit = cap / 2;
         g.tab.clear();
         g.tab.resize(cap, (0, 0));
         g.lid.clear();
         g.off.clear();
-        for part in evs_in.clone() {
-            for e in part {
-                let mut i = mix(e.person) as usize & mask;
-                let l = loop {
-                    let s = unsafe { *g.tab.get_unchecked(i) };
-                    if s.0 == e.person {
-                        break s.1;
-                    }
-                    if s.0 == 0 {
-                        let l = g.off.len() as u32;
-                        if l as usize >= limit {
-                            cap *= 4;
-                            continue 'build;
-                        }
-                        g.tab[i] = (e.person, l);
-                        g.off.push(0);
-                        break l;
-                    }
-                    i = (i + 1) & mask;
-                };
-                g.off[l as usize] += 1;
-                g.lid.push(l);
-            }
+        if assign_lids(g, mask, limit, plain_in.clone()) && assign_lids(g, mask, limit, pur_in.clone()) {
+            break mask;
         }
-        break mask;
+        cap *= 4;
     };
     let nl = g.off.len();
     let mut acc = 0u32;
@@ -846,15 +903,8 @@ fn group_partition<'a>(
     g.pkey.clear();
     g.pkey.resize(nl, 0);
     let mut k = 0;
-    for part in evs_in {
-        for e in part {
-            let l = g.lid[k] as usize;
-            g.evs[g.pos[l] as usize] = Ev2::of(e);
-            g.pkey[l] = e.person;
-            g.pos[l] += 1;
-            k += 1;
-        }
-    }
+    scatter_lids(g, &mut k, plain_in);
+    scatter_lids(g, &mut k, pur_in);
     for l in 0..nl {
         let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
         if s.len() > 1 {
@@ -1156,7 +1206,12 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let deduped: Vec<DedupState> = par_run(
         nt,
         np,
-        || DedupState { out: (0..npp).map(|_| Vec::with_capacity(se_res)).collect(), table: Vec::new(), surv: Vec::new() },
+        || DedupState {
+            out: (0..npp).map(|_| Vec::with_capacity(se_res)).collect(),
+            outp: (0..npp).map(|_| Vec::with_capacity(se_res / 16 + 8)).collect(),
+            table: Vec::new(),
+            surv: Vec::new(),
+        },
         |st, p| {
             let total: usize = parsed.iter().map(|s| s.ev[p].len()).sum();
             let cap = (total + total / 2).next_power_of_two().max(16);
@@ -1202,13 +1257,19 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                 }
                 let e = surv[i];
                 let person = persons.get(e.uid);
-                st.out[parts.by_person(person)].push(Se {
-                    person,
-                    ts: ws + (e.tp >> 26) as i64,
-                    price: ((e.tp >> 2) & 0xff_ffff) as u32,
-                    cat: (e.meta & 0xffff) as u16,
-                    purchase: e.tp & 2 != 0,
-                });
+                let q = parts.by_person(person);
+                let ts = ws + (e.tp >> 26) as i64;
+                if e.tp & 2 == 0 {
+                    st.out[q].push(Sv { person, ts });
+                } else {
+                    st.outp[q].push(Se {
+                        person,
+                        ts,
+                        price: ((e.tp >> 2) & 0xff_ffff) as u32,
+                        cat: (e.meta & 0xffff) as u16,
+                        purchase: true,
+                    });
+                }
             }
         },
     );
@@ -1221,7 +1282,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let organic = ncamp as u16;
     let ncat = ctx.cat_names.len();
     let mut order: Vec<(usize, usize)> =
-        (0..npp).map(|q| (deduped.iter().map(|d| d.out[q].len()).sum::<usize>(), q)).collect();
+        (0..npp).map(|q| (deduped.iter().map(|d| d.out[q].len() + d.outp[q].len()).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let aggs: Vec<AggState> = par_run(
         nt,
@@ -1240,7 +1301,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         |st, oi| {
             let (n, q) = order[oi];
             let mut g = std::mem::take(&mut st.g);
-            group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), parsed.iter().map(|s| s.ck[q].as_slice()));
+            group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), deduped.iter().map(|d| d.outp[q].as_slice()), parsed.iter().map(|s| s.ck[q].as_slice()));
             for l in 0..g.off.len() - 1 {
                 let ev = &g.evs[g.off[l] as usize..g.off[l + 1] as usize];
                 let person = g.pkey[l];
