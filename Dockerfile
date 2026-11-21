@@ -8,9 +8,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN set -eu; \
-    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then T=aarch64-unknown-linux-gnu; CPU=generic; \
-    else T=x86_64-unknown-linux-gnu; CPU=x86-64-v3; fi; \
-    RUSTFLAGS="-C target-cpu=$CPU -C target-feature=+crt-static" \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then T=aarch64-unknown-linux-gnu; CPU=generic; FEAT=; \
+    else T=x86_64-unknown-linux-gnu; CPU=x86-64-v3; FEAT=,+pclmulqdq; fi; \
+    RUSTFLAGS="-C target-cpu=$CPU -C target-feature=+crt-static$FEAT" \
       cargo build --release --locked --target "$T" ${JOBS:+-j "$JOBS"}; \
     cp "target/$T/release/sessions" /sessions
 

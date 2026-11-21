@@ -239,16 +239,8 @@ pub fn positions<const N: usize>(len: usize, cm: u128, qm: u128, pos: &mut [usiz
         return None;
     }
     let quoted = (qlo | qhi) != 0;
-    if quoted {
-        let c = clo as u128 | (chi as u128) << 64;
-        let q = qlo as u128 | (qhi as u128) << 64;
-        let seps = c | (1u128 << len);
-        let starts = (c << 1) | 1;
-        let ends = seps >> 1;
-        let bad = (q & !(starts | ends)) | (q & starts & ends) | (prefix_xor(q) & seps);
-        if bad != 0 {
-            return None;
-        }
+    if quoted && quotes_bad(len, clo, chi, qlo, qhi) {
+        return None;
     }
     let mut k = 0usize;
     let mut x = clo;
@@ -274,4 +266,34 @@ pub fn field<'a, const N: usize>(base: *const u8, pos: &[usize; N], quoted: bool
     let e = pos[k];
     let qd = (quoted && unsafe { *base.add(s) } == b'"') as usize;
     unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) }
+}
+
+/// Prefix XOR of a 64-bit mask (bit i = parity of bits 0..=i).
+#[inline(always)]
+fn pxor64(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let r = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
+        _mm_cvtsi128_si64(r) as u64
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+    prefix_xor64(x)
+}
+
+/// The quote rule of `fields` on the two 64-bit halves of a line's masks (len < 128).
+#[inline(always)]
+fn quotes_bad(len: usize, clo: u64, chi: u64, qlo: u64, qhi: u64) -> bool {
+    let (elo, ehi) = if len < 64 { (1u64 << len, 0u64) } else { (0u64, 1u64 << (len - 64)) };
+    let seps_lo = clo | elo;
+    let seps_hi = chi | ehi;
+    let starts_lo = (clo << 1) | 1;
+    let starts_hi = (chi << 1) | (clo >> 63);
+    let ends_lo = (seps_lo >> 1) | (seps_hi << 63);
+    let ends_hi = seps_hi >> 1;
+    let px_lo = pxor64(qlo);
+    let px_hi = pxor64(qhi) ^ (0u64.wrapping_sub(qlo.count_ones() as u64 & 1));
+    let bad_lo = (qlo & !(starts_lo | ends_lo)) | (qlo & starts_lo & ends_lo) | (px_lo & seps_lo);
+    let bad_hi = (qhi & !(starts_hi | ends_hi)) | (qhi & starts_hi & ends_hi) | (px_hi & seps_hi);
+    (bad_lo | bad_hi) != 0
 }

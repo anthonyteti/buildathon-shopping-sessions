@@ -1997,6 +1997,14 @@ mod tests {
             if oa {
                 assert_eq!(a, b);
             }
+            let mut p = [0usize; N];
+            let r = scan::positions::<N>(len, cm, qm, &mut p);
+            assert_eq!(r.is_some(), ob, "positions {:?}", String::from_utf8_lossy(line));
+            if let Some(q) = r {
+                for k in 0..N {
+                    assert_eq!(scan::field::<N>(line.as_ptr(), &p, q, k), b[k]);
+                }
+            }
         }
     }
 
