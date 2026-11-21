@@ -639,12 +639,17 @@ pub struct Ctx {
 
 // ---------------------------------------------------------------- parallel helper
 
+/// Per-thread busy/finish times of the last parallel phase (ms), for the phase log.
+static PHASE_STATS: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
+
 fn par_run<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(nt: usize, n: usize, init: I, f: F) -> Vec<S> {
     let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
+    let t0 = Instant::now();
+    let out: Vec<(S, f64, f64)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
+                    let start = t0.elapsed().as_secs_f64();
                     let mut st = init();
                     loop {
                         let i = next.fetch_add(1, Relaxed);
@@ -653,12 +658,15 @@ fn par_run<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(nt: usize,
                         }
                         f(&mut st, i);
                     }
-                    st
+                    let end = t0.elapsed().as_secs_f64();
+                    (st, (end - start) * 1e3, end * 1e3)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    });
+    *PHASE_STATS.lock().unwrap() = out.iter().map(|x| (x.1, x.2)).collect();
+    out.into_iter().map(|x| x.0).collect()
 }
 
 // ---------------------------------------------------------------- records
@@ -986,6 +994,14 @@ fn instructions() -> f64 {
 }
 
 fn tlog(t0: &Instant, what: &str) {
+    let stats = std::mem::take(&mut *PHASE_STATS.lock().unwrap());
+    if !stats.is_empty() {
+        let busy_min = stats.iter().map(|x| x.0).fold(f64::MAX, f64::min);
+        let busy_max = stats.iter().map(|x| x.0).fold(0.0, f64::max);
+        let end_min = stats.iter().map(|x| x.1).fold(f64::MAX, f64::min);
+        let end_max = stats.iter().map(|x| x.1).fold(0.0, f64::max);
+        eprintln!("    threads: busy {busy_min:.1}-{busy_max:.1} ms, finished {end_min:.1}-{end_max:.1} ms");
+    }
     let (u, s) = cpu_ms();
     eprintln!(
         "[{:8.1} ms] [cpu {:8.1} ms] [sys {:7.1} ms] [ins {:6.2} G] {what}",
@@ -1460,6 +1476,22 @@ fn flush_ud(st: &mut AggState, person: u64, day: i64, sessions: i32, events: i32
     st.rows.push(UdRow { person, day: day as i32, sessions, events, revenue, top });
 }
 
+/// Floor: read every byte of every input CSV on all threads (8 MB chunks), then exit.
+fn bench_touch(ctx: &Ctx, t0: &Instant) {
+    let mut chunks = Vec::new();
+    make_chunks(&ctx.links, 0, 8 << 20, &mut chunks);
+    make_chunks(&ctx.events, 1, 8 << 20, &mut chunks);
+    make_chunks(&ctx.clicks, 2, 8 << 20, &mut chunks);
+    chunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    let sums = par_run(ctx.nthreads, chunks.len(), || 0u64, |acc, i| {
+        let c = chunks[i];
+        let m = match c.kind { 0 => &ctx.links, 1 => &ctx.events, _ => &ctx.clicks };
+        let d = &m[c.file as usize][c.start..c.end];
+        *acc += memchr::memchr_iter(b'\n', d).count() as u64;
+    });
+    tlog(t0, &format!("touched all inputs ({} lines)", sums.iter().sum::<u64>()));
+}
+
 /// Single-thread microbenchmarks over the event files (development only).
 fn bench(ctx: &Ctx, mode: &str) {
     let t = Instant::now();
@@ -1704,7 +1736,11 @@ fn main() {
     tlog(&t0, "inputs mapped");
 
     if let Ok(mode) = std::env::var("SS_BENCH") {
-        bench(&ctx, &mode);
+        if mode == "touch" {
+            bench_touch(&ctx, &t0);
+        } else {
+            bench(&ctx, &mode);
+        }
         std::process::exit(0);
     }
     let p7 = Pack7 { fail: AtomicBool::new(false) };
