@@ -10,6 +10,7 @@ const BIG: usize = 64 << 10;
 const RESERVE: usize = 1 << 37; // 128 GiB of address space, MAP_NORESERVE
 const ALIGN: usize = 64;
 /// Ask Linux for transparent huge pages on the arena.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const HUGE_PAGES: bool = true;
 
 static BASE: AtomicUsize = AtomicUsize::new(0); // 0 = not set up yet, 1 = unavailable
