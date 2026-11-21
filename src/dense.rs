@@ -46,7 +46,6 @@ const XU_LIMIT: u64 = 1 << 31;
 /// Flag in a record's user field: the user ID is outside the scheme; the low 31 bits
 /// are thread (4 bits) and index (27 bits) into that thread's side table.
 const EXO: u32 = 1 << 31;
-const MULTI: u64 = u64::MAX;
 const H8: u64 = 0x8080_8080_8080_8080;
 const ONES: u64 = 0x0101_0101_0101_0101;
 /// Slow-path person partitions.
@@ -160,8 +159,7 @@ fn xu_of_key(k: u64, ku: u64) -> u32 {
     }
 }
 
-/// A linked ID inside the scheme: its user index, alias and person name (bit 63: the
-/// person spans more than one user index or has IDs outside the scheme).
+/// A linked ID inside the scheme: its user index, alias and person name.
 #[derive(Clone, Copy, Default)]
 struct Ul {
     u: u32,
@@ -518,18 +516,29 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     if nt > 16 || we - cws >= (1i64 << 31) || ctx.camp_ids.len() >= u16::MAX as usize - 1 || ctx.cat_names.len() > 255 {
         return None;
     }
-    let keys = recover_keys(ctx, t0)?;
-    let (ke, ku, kc) = (keys.e, keys.u, keys.c);
-    tlog(t0, "keys recovered");
-
-    // ---- links: on their own phase, or (SS_LINKS_OVERLAP=1) by one worker while the
-    // others parse events and clicks (nothing in the parse needs persons)
+    // ---- keys, and links: on their own phase (keys recovered by one more thread while
+    // the links are joined), or (SS_LINKS_OVERLAP=1) by one worker while the others parse
+    // events and clicks (nothing in the parse needs persons)
     let links_par = std::env::var_os("SS_LINKS_OVERLAP").is_none();
-    let links_cell: std::sync::OnceLock<Option<(CMap, Vec<Ul>)>> = std::sync::OnceLock::new();
-    if links_par {
-        let _ = links_cell.set(build_links(ctx, pk, ku, check, nt));
-        tlog(t0, "links joined");
-    }
+    let links_cell: std::sync::OnceLock<Option<(CMap, Vec<Ul>, Vec<u64>)>> = std::sync::OnceLock::new();
+    let keys = if links_par {
+        let (keys, cm) = std::thread::scope(|sc| {
+            let h = sc.spawn(|| recover_keys(ctx, t0));
+            let cm = links_join(ctx, pk, check, nt);
+            (h.join().unwrap(), cm)
+        });
+        let keys = keys?;
+        tlog(t0, "keys recovered, links joined");
+        let (ul, multi) = links_table(&cm, keys.u, nt);
+        let _ = links_cell.set(Some((cm, ul, multi)));
+        tlog(t0, "links tabled");
+        keys
+    } else {
+        let keys = recover_keys(ctx, t0)?;
+        tlog(t0, "keys recovered");
+        keys
+    };
+    let (ke, ku, kc) = (keys.e, keys.u, keys.c);
 
     // ---- parse events and clicks into dense-index partitions
     let ev_bytes: usize = ctx.events.iter().map(|m| m.len()).sum();
@@ -603,16 +612,12 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     if pk.failed() || parsed.iter().any(|s| s.bad) {
         return None;
     }
-    let (cm, ul) = links_cell.into_inner().flatten()?;
+    let (cm, ul, multi) = links_cell.into_inner().flatten()?;
     let mut by_tid: Vec<usize> = vec![0; parsed.len()];
     for (i, s) in parsed.iter().enumerate() {
         by_tid[s.tid as usize] = i;
     }
-    let person_of = |uid: u64| -> u64 {
-        let r = if cm.maybe(uid) { cm.get_linked(uid) } else { uid };
-        // a root's word holds the per-person state (bit 63): its name is its own key
-        if r >> 63 != 0 { uid } else { r }
-    };
+    let person_of = |uid: u64| -> u64 { if cm.maybe(uid) { cm.get_linked(uid) } else { uid } };
     let side = |xs: u32, ev: bool| -> u64 {
         let s = &parsed[by_tid[((xs >> 27) & 15) as usize]];
         let i = (xs & ((1 << 27) - 1)) as usize;
@@ -738,7 +743,8 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
 
     // ---- IDs outside the scheme: dedup them alone (they never equal an ID inside it);
     // their persons go to the slow path
-    let mut slow_names: HashSet<u64, BuildHasherDefault<Fx>> = HashSet::default();
+    // persons whose IDs decode to several user indexes are slow
+    let mut slow_names: HashSet<u64, BuildHasherDefault<Fx>> = multi.iter().copied().collect();
     let mut slow_e0: Vec<Se> = Vec::new();
     let mut slow_c0: Vec<Ck> = Vec::new();
     {
@@ -789,7 +795,7 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     // ---- global segment lists; a user index in more than one segment is slow
     // positions become global (start of the partition in the compacted concatenation)
     let merge = |lists: Vec<&(usize, usize, Vec<Seg>)>, first: &[u64]| -> Vec<Seg> {
-        let mut v: Vec<Seg> = Vec::new();
+        let mut v: Vec<Seg> = Vec::with_capacity(lists.iter().map(|x| x.2.len()).sum());
         for (p, _, l) in lists {
             let f = first[*p] as u32;
             for g in l {
@@ -977,9 +983,8 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     Some(())
 }
 
-/// Links: parse, union-find, the multi-user flags and the table of linked IDs by user
-/// index, on `nt` threads.
-fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) -> Option<(CMap, Vec<Ul>)> {
+/// Links: parse and union-find; every slot's word 1 holds its person's name.
+fn links_join<P: Packer>(ctx: &Ctx, pk: &P, check: bool, nt: usize) -> CMap {
     // ---- links + parallel union-find (as in the fused pipeline)
     let mut lchunks = Vec::new();
     make_chunks(&ctx.links, 0, 4 << 20, &mut lchunks);
@@ -1026,11 +1031,17 @@ fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) ->
     par_run(nt, nfin, || 0usize, |n, i| {
         *n += cm.finish_range(i * cap / nfin, (i + 1) * cap / nfin);
     });
-    // A person whose IDs inside the scheme do not all decode to one user index is handled
-    // by the slow path. Per person, the user index seen so far is kept in its root slot's
-    // name word (a root's name is its own key, so the word is free): bit 63 | u, or
-    // MULTI. Readers of the map treat a value with bit 63 as "the name is the key".
-    par_run(nt, nfin, || (), |_, i| {
+    cm
+}
+
+/// The table of linked IDs inside the scheme (user index, alias, name), sorted by user
+/// index, and the names of persons whose IDs inside the scheme decode to more than one
+/// user index (those go to the slow path).
+fn links_table(cm: &CMap, ku: u64, nt: usize) -> (Vec<Ul>, Vec<u64>) {
+    const NB: usize = 64;
+    let cap = cm.t.len();
+    let nfin = (cap / 65536).max(1);
+    let parts: Vec<(Vec<Ul>, Vec<Vec<(u64, u32)>>)> = par_run(nt, nfin, || (Vec::new(), vec![Vec::new(); NB]), |out, i| {
         for s in i * cap / nfin..(i + 1) * cap / nfin {
             let k = cm.t[s][0].load(Relaxed);
             if k == 0 {
@@ -1038,57 +1049,48 @@ fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) ->
             }
             let xu = xu_of_key(k, ku);
             if xu == u32::MAX {
-                // outside the scheme: only matters if a row uses it (then that row's
-                // person is put in the slow set after placement)
-                continue;
+                continue; // outside the scheme: matters only if a row uses it (see placement)
             }
-            let r = cm.find(s as u32) as usize;
-            let enc = 1u64 << 63 | (xu >> 9) as u64;
-            let w = &cm.t[r][1];
-            let mut cur = w.load(Relaxed);
-            loop {
-                if cur == enc || cur == MULTI {
-                    break;
-                }
-                if cur >> 63 == 0 {
-                    match w.compare_exchange(cur, enc, Relaxed, Relaxed) {
-                        Ok(_) => break,
-                        Err(x) => cur = x,
+            let name = cm.t[s][1].load(Relaxed);
+            out.0.push(Ul { u: xu >> 9, alias: xu & 511, name });
+            out.1[(mix(name) >> 58) as usize].push((name, xu >> 9));
+        }
+    });
+    let parts = &parts;
+    let multi: Vec<Vec<u64>> = par_run(nt, NB, Vec::new, |out, b| {
+        let mut first: FxMap<u64, u32> = FxMap::default();
+        for (_, bk) in parts {
+            for &(name, u) in &bk[b] {
+                match first.get_mut(&name) {
+                    None => {
+                        first.insert(name, u);
                     }
-                } else {
-                    w.store(MULTI, Relaxed);
-                    break;
+                    Some(f) => {
+                        if *f != u && *f != u32::MAX {
+                            *f = u32::MAX;
+                            out.push(name);
+                        }
+                    }
                 }
             }
         }
     });
-    // linked IDs inside the scheme, with their person's name and flag, sorted by user index
-    // (pass 2 walks this table in order: no hash lookups there)
-    let ul_parts: Vec<Vec<Ul>> = par_run(nt, nfin, Vec::new, |out, i| {
-        for s in i * cap / nfin..(i + 1) * cap / nfin {
-            let k = cm.t[s][0].load(Relaxed);
-            if k == 0 {
-                continue;
-            }
-            let xu = xu_of_key(k, ku);
-            if xu == u32::MAX {
-                continue;
-            }
-            let r = cm.find(s as u32) as usize;
-            let name = cm.t[r][0].load(Relaxed);
-            let multi = cm.t[r][1].load(Relaxed) == MULTI;
-            out.push(Ul { u: xu >> 9, alias: xu & 511, name: name | (multi as u64) << 63 });
-        }
-    });
-    let mut ul: Vec<Ul> = Vec::with_capacity(ul_parts.iter().map(|v| v.len()).sum());
-    for v in &ul_parts {
-        ul.extend_from_slice(v);
+    let mut ul: Vec<Ul> = Vec::with_capacity(parts.iter().map(|v| v.0.len()).sum());
+    for v in parts {
+        ul.extend_from_slice(&v.0);
     }
     if !ul.is_empty() {
         let mut tmp = Vec::new();
         radix_sort_u32(&mut ul, &mut tmp, |e| e.u);
     }
-    Some((cm, ul))
+    (ul, multi.into_iter().flatten().collect())
+}
+
+/// Links joined and tabled on `nt` threads.
+fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) -> Option<(CMap, Vec<Ul>, Vec<u64>)> {
+    let cm = links_join(ctx, pk, check, nt);
+    let (ul, multi) = links_table(&cm, ku, nt);
+    Some((cm, ul, multi))
 }
 
 #[inline(always)]
@@ -1148,11 +1150,11 @@ fn do_user(
         if a.0 == stamp {
             return a.1;
         }
-        let (name, multi) = match links.iter().find(|e| e.alias == alias) {
-            Some(e) => (e.name & !(1u64 << 63), e.name >> 63 != 0),
-            None => (id_key(b'u', (u as u64) << 9 | alias as u64, ku), false),
+        let name = match links.iter().find(|e| e.alias == alias) {
+            Some(e) => e.name,
+            None => id_key(b'u', (u as u64) << 9 | alias as u64, ku),
         };
-        let slow = us || multi || (!slow_names.is_empty() && slow_names.contains(&name));
+        let slow = us || slow_names.contains(&name);
         let ci = w.cache.len() as u16;
         w.cache.push((name, slow));
         w.aidx[alias as usize] = (stamp, ci);
