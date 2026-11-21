@@ -868,6 +868,8 @@ struct Group {
     coff: Vec<u32>,
     clid: Vec<u32>,
     cks: Vec<Ck>,
+    tmp_e: Vec<Ev2>,
+    tmp_c: Vec<Ck>,
 }
 
 /// A record that can be grouped by person.
@@ -980,7 +982,7 @@ fn group_partition<'a>(
     scatter_lids(g, &mut k, pur_in);
     for l in 0..nl {
         let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
-        sort_by_ts(s);
+        sort_by_ts(s, &mut g.tmp_e);
     }
     group_clicks(g, mask, cks_in);
 }
@@ -1034,7 +1036,7 @@ fn group_clicks<'a>(g: &mut Group, mask: usize, cks_in: impl Iterator<Item = &'a
     }
     for l in 0..nl {
         let s = &mut g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
-        sort_clicks(s);
+        sort_clicks(s, &mut g.tmp_c);
     }
 }
 
@@ -1053,21 +1055,96 @@ fn insertion_sort<T: Copy, K: PartialOrd>(s: &mut [T], key: impl Fn(&T) -> K) {
     }
 }
 
-#[inline(always)]
-fn sort_by_ts(s: &mut [Ev2]) {
-    if s.len() <= 24 {
-        insertion_sort(s, |e| e.ts);
-    } else {
-        s.sort_unstable_by_key(|e| e.ts);
+/// Stable LSD radix sort of `v` by a 32-bit key (11-bit digits; a pass whose digit is
+/// the same for every element is skipped). `tmp` is scratch space.
+fn radix_sort_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    let n = v.len();
+    let mut h = [[0u32; 2048]; 3];
+    for x in v.iter() {
+        let k = key(x);
+        h[0][(k & 2047) as usize] += 1;
+        h[1][((k >> 11) & 2047) as usize] += 1;
+        h[2][(k >> 22) as usize] += 1;
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut in_v = true; // the data is in v (else in tmp)
+    let k0 = key(&v[0]);
+    for pass in 0..3 {
+        let sh = 11 * pass as u32;
+        let hp = &mut h[pass];
+        if hp[((k0 >> sh) & 2047) as usize] as usize == n {
+            continue;
+        }
+        let mut acc = 0u32;
+        for c in hp.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        let (src, dst): (&[T], &mut [T]) = if in_v { (&*v, &mut tmp[..]) } else { (&tmp[..], &mut *v) };
+        // (the borrow checker cannot see that src and dst differ; use raw pointers)
+        let (sp, dp) = (src.as_ptr(), dst.as_mut_ptr());
+        for i in 0..n {
+            let x = unsafe { *sp.add(i) };
+            let d = ((key(&x) >> sh) & 2047) as usize;
+            let o = unsafe { hp.get_unchecked_mut(d) };
+            unsafe { *dp.add(*o as usize) = x };
+            *o += 1;
+        }
+        in_v = !in_v;
+    }
+    if !in_v {
+        v.copy_from_slice(&tmp[..n]);
     }
 }
 
+/// Insertion sort for the short slices most persons have, radix sort for long ones.
 #[inline(always)]
-fn sort_clicks(s: &mut [Ck]) {
+fn sort_by_ts(s: &mut [Ev2], tmp: &mut Vec<Ev2>) {
+    if s.len() <= 24 {
+        insertion_sort(s, |e| e.ts);
+    } else if s.len() < 256 {
+        s.sort_unstable_by_key(|e| e.ts);
+    } else {
+        let lo = s.iter().map(|e| e.ts).min().unwrap();
+        let hi = s.iter().map(|e| e.ts).max().unwrap();
+        if hi - lo < (1i64 << 32) {
+            radix_sort_u32(s, tmp, |e| (e.ts - lo) as u32);
+        } else {
+            s.sort_unstable_by_key(|e| e.ts);
+        }
+    }
+}
+
+/// Clicks by (ts, click_id).
+#[inline(always)]
+fn sort_clicks(s: &mut [Ck], tmp: &mut Vec<Ck>) {
     if s.len() <= 24 {
         insertion_sort(s, |c| (c.ts, c.cid));
-    } else {
+    } else if s.len() < 256 {
         s.sort_unstable_by_key(|c| (c.ts, c.cid));
+    } else {
+        let lo = s.iter().map(|c| c.ts).min().unwrap();
+        let hi = s.iter().map(|c| c.ts).max().unwrap();
+        if hi - lo < (1i64 << 32) {
+            radix_sort_u32(s, tmp, |c| (c.ts - lo) as u32);
+            // equal timestamps: by click_id
+            let mut i = 0;
+            while i < s.len() {
+                let mut j = i + 1;
+                while j < s.len() && s[j].ts == s[i].ts {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    insertion_sort(&mut s[i..j], |c| c.cid);
+                }
+                i = j;
+            }
+        } else {
+            s.sort_unstable_by_key(|c| (c.ts, c.cid));
+        }
     }
 }
 
@@ -2056,6 +2133,59 @@ mod tests {
                     assert_eq!(scan::field::<N>(line.as_ptr(), &p, q, k), b[k]);
                 }
             }
+            // the 64- and 96-byte splitters
+            let m = unsafe { scan::masks96(buf.as_ptr()) };
+            let mut p2 = [0usize; N];
+            let r2 = if len < 64 {
+                assert_eq!(m[0].trailing_zeros() as usize, len);
+                let m64 = unsafe { scan::masks64(buf.as_ptr()) };
+                assert_eq!(m64, [m[0], m[2], m[4], m[6]]);
+                Some(scan::positions64::<N>(len, m64[1], m64[2], &mut p2))
+            } else if len < 96 {
+                assert_eq!(m[0], 0);
+                assert_eq!(64 + m[1].trailing_zeros() as usize, len);
+                Some(scan::positions96::<N>(len, m[2], m[3], m[4], m[5], &mut p2))
+            } else {
+                None
+            };
+            if let Some(r2) = r2 {
+                assert_eq!(r2, r, "positions64/96 {:?}", String::from_utf8_lossy(line));
+                if r.is_some() {
+                    assert_eq!(p2, p);
+                }
+            }
+            let bad = line.iter().any(|&x| x == 0 || x >= 0x80);
+            if len < 96 {
+                let bl = if len < 64 { m[6] & ((1u64 << len) - 1) } else { m[6] | (m[7] & ((1u64 << (len - 64)) - 1)) };
+                assert_eq!(bl != 0, bad);
+            }
+        }
+    }
+
+    #[test]
+    fn radix_sorts_match() {
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut te = Vec::new();
+        let mut tc = Vec::new();
+        for it in 0..400 {
+            let n = (rng(&mut s) % 3000) as usize + 1;
+            let span = [1u64 << 8, 1 << 20, 1 << 31, (1 << 32) - 1, 1 << 40][it % 5];
+            let base = 1_800_000_000_000i64;
+            let mut e: Vec<Ev2> = (0..n).map(|i| Ev2 { ts: base + (rng(&mut s) % span) as i64, pc: i as u64 }).collect();
+            let mut want = e.clone();
+            want.sort_by_key(|x| x.ts);
+            sort_by_ts(&mut e, &mut te);
+            assert!(e.iter().zip(&want).all(|(a, b)| a.ts == b.ts));
+            let mut sorted_pc: Vec<u64> = e.iter().map(|x| x.pc).collect();
+            sorted_pc.sort();
+            assert!(sorted_pc.iter().enumerate().all(|(i, &v)| v == i as u64));
+            let mut c: Vec<Ck> = (0..n)
+                .map(|_| Ck { person: 7, ts: base + (rng(&mut s) % span) as i64, cid: rng(&mut s) % 50, camp: (rng(&mut s) % 9) as u16 })
+                .collect();
+            let mut wc = c.clone();
+            wc.sort_by_key(|x| (x.ts, x.cid));
+            sort_clicks(&mut c, &mut tc);
+            assert!(c.iter().zip(&wc).all(|(a, b)| a.ts == b.ts && a.cid == b.cid));
         }
     }
 

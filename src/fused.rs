@@ -530,7 +530,7 @@ fn group_fused(g: &mut Group, n: usize, parsed: &[PState], dead: &[Dead], q: usi
     }
     for l in 0..nl {
         let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
-        sort_by_ts(s);
+        sort_by_ts(s, &mut g.tmp_e);
     }
     group_clicks(g, mask, parsed.iter().map(|s| s.ck.vecs[q].as_slice()));
 }
