@@ -755,32 +755,42 @@ fn group_partition<'a>(
     evs_in: impl Iterator<Item = &'a [Se]> + Clone,
     cks_in: impl Iterator<Item = &'a [Ck]> + Clone,
 ) {
-    let cap = (n * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    g.tab.clear();
-    g.tab.resize(cap, (0, 0));
-    g.lid.clear();
-    g.off.clear();
-    for part in evs_in.clone() {
-        for e in part {
-            let mut i = mix(e.person) as usize & mask;
-            let l = loop {
-                let s = g.tab[i];
-                if s.0 == e.person {
-                    break s.1;
-                }
-                if s.0 == 0 {
-                    let l = g.off.len() as u32;
-                    g.tab[i] = (e.person, l);
-                    g.off.push(0);
-                    break l;
-                }
-                i = (i + 1) & mask;
-            };
-            g.off[l as usize] += 1;
-            g.lid.push(l);
+    // local person ids; the table starts small (persons are far fewer than events)
+    // and is rebuilt larger if it fills up
+    let mut cap = (n / 4).next_power_of_two().max(64);
+    let mask = 'build: loop {
+        let mask = cap - 1;
+        let limit = cap / 2;
+        g.tab.clear();
+        g.tab.resize(cap, (0, 0));
+        g.lid.clear();
+        g.off.clear();
+        for part in evs_in.clone() {
+            for e in part {
+                let mut i = mix(e.person) as usize & mask;
+                let l = loop {
+                    let s = unsafe { *g.tab.get_unchecked(i) };
+                    if s.0 == e.person {
+                        break s.1;
+                    }
+                    if s.0 == 0 {
+                        let l = g.off.len() as u32;
+                        if l as usize >= limit {
+                            cap *= 4;
+                            continue 'build;
+                        }
+                        g.tab[i] = (e.person, l);
+                        g.off.push(0);
+                        break l;
+                    }
+                    i = (i + 1) & mask;
+                };
+                g.off[l as usize] += 1;
+                g.lid.push(l);
+            }
         }
-    }
+        break mask;
+    };
     let nl = g.off.len();
     let mut acc = 0u32;
     for x in g.off.iter_mut() {
