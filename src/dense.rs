@@ -23,7 +23,7 @@
 //! None of this assumes the keys are "right": any key gives a bijection, and the segment
 //! checks decide what is handled in place. Wrong keys only make the slow path big.
 use super::*;
-use crate::fused::{CMap, zeroed_vec};
+use crate::fused::CMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -175,13 +175,14 @@ struct Ul {
 /// with the low `low_bits` bits of k equal to `low`. Meet in the middle: 2^(t - low_bits)
 /// candidates when t >= 20.
 fn mitm(nt: usize, pivot: u64, tests: &[u64], t: u32, low_bits: u32, low: u64) -> Option<u64> {
-    const S: u32 = 20;
-    let smask = (1u64 << S) - 1;
-    let hmask = (1u64 << (40 - S)) - 1;
+    // split point: about 2^(t - low_bits) + 2^(sp - low_bits + 1) candidates
+    let sp: u32 = (t / 2).max(low_bits + 2).min(20);
+    let smask = (1u64 << sp) - 1;
+    let hmask = (1u64 << (40 - sp)) - 1;
     let bound = 1u64 << t;
     let need = tests.len() * 9 / 10;
-    let per = (1u64 << (t.saturating_sub(S))) + 2;
-    let nlow = 1u64 << (S - low_bits);
+    let per = (1u64 << (t.saturating_sub(sp))) + 2;
+    let nlow = 1u64 << (sp - low_bits);
     let blocks = 64u64.min(nlow);
     let found = AtomicU64::new(u64::MAX);
     par_run(nt.min(blocks as usize), blocks as usize, || (), |_, bi| {
@@ -193,11 +194,11 @@ fn mitm(nt: usize, pivot: u64, tests: &[u64], t: u32, low_bits: u32, low: u64) -
             let kl = low | (j << low_bits);
             let a = (((pivot ^ kl) & smask).wrapping_mul(M1I)) & MASK40;
             let neg = (MASK40 + 1 - a) & MASK40;
-            let b0 = neg >> S;
+            let b0 = neg >> sp;
             for d in 0..per {
                 let b = (b0 + d) & hmask;
-                let kh = (b.wrapping_mul(M1) & hmask) ^ (pivot >> S);
-                let k = (kh << S) | kl;
+                let kh = (b.wrapping_mul(M1) & hmask) ^ (pivot >> sp);
+                let k = (kh << sp) | kl;
                 if unkey(pivot, k) >= bound {
                     continue;
                 }
@@ -291,7 +292,7 @@ pub struct Keys {
     pub ck_line: f64,
 }
 
-pub fn recover_keys(ctx: &Ctx) -> Option<Keys> {
+pub fn recover_keys(ctx: &Ctx, t0: &Instant) -> Option<Keys> {
     let nt = ctx.nthreads;
     let mut zu_all = Vec::new();
     let mut pairs = Vec::new(); // (z_e, z_u)
@@ -304,6 +305,7 @@ pub fn recover_keys(ctx: &Ctx) -> Option<Keys> {
             pairs.push((ze, zu));
         }
     });
+    tlog(t0, "keys: events sampled");
     if zu_all.len() < 1000 {
         return None;
     }
@@ -324,7 +326,9 @@ pub fn recover_keys(ctx: &Ctx) -> Option<Keys> {
     // events of user 0 (a whale in the generator: a few % of events, indexes below that)
     let u0: Vec<u64> = pairs.iter().filter(|&&(_, zu)| unkey(zu, ku) >> 9 == 0).map(|&(ze, _)| ze).collect();
     let te = 64 - ((est_lines as f64 * 0.04) as u64 + 1).leading_zeros();
+    tlog(t0, "keys: user key");
     let ke = mitm_retry(nt, &u0, te, 0, 0)?;
+    tlog(t0, "keys: event key");
     // clicks of user 0
     let mut cu0 = Vec::new();
     let (cb, cl) = sample_rows::<4>(&ctx.clicks, 6, 3000, |f| {
@@ -428,10 +432,64 @@ struct Seg {
 /// Per-partition placement results.
 #[derive(Default)]
 struct PlaceOut {
-    segs: Vec<(usize, Vec<Seg>)>,  // (partition, segments) for events
-    csegs: Vec<(usize, Vec<Seg>)>, // for clicks
+    segs: Vec<(usize, usize, Vec<Seg>)>,  // (partition, kept records, segments) for events
+    csegs: Vec<(usize, usize, Vec<Seg>)>, // for clicks
     slow_e: Vec<Se>,
     slow_c: Vec<Ck>,
+    loc: Vec<R>, // scratch: one partition's slots (all zero between uses)
+}
+
+/// The kept records of every partition, compacted in index order into the memory of that
+/// partition's parse buffers: chunks (pointer, length, partition) and their start positions
+/// in the concatenation of all of them.
+struct Comp {
+    starts: Vec<u64>,
+    chunks: Vec<(usize, u32, u32)>,
+}
+impl Comp {
+    /// Builds the chunk table: partition p (in order) has `kept[p]` records spread over the
+    /// buffers `bufs[p]` (pointer, capacity in records), filled in order.
+    fn new(kept: &[usize], bufs: &[Vec<(usize, usize)>]) -> (Comp, Vec<u64>) {
+        let mut c = Comp { starts: Vec::new(), chunks: Vec::new() };
+        let mut first = vec![0u64; kept.len()];
+        let mut at = 0u64;
+        for (p, &m) in kept.iter().enumerate() {
+            first[p] = at;
+            let mut left = m;
+            for &(ptr, cap) in &bufs[p] {
+                if left == 0 {
+                    break;
+                }
+                let n = left.min(cap);
+                if n > 0 {
+                    c.starts.push(at);
+                    c.chunks.push((ptr, n as u32, p as u32));
+                    at += n as u64;
+                    left -= n;
+                }
+            }
+            assert!(left == 0, "compaction overflow");
+        }
+        c.starts.push(at);
+        (c, first)
+    }
+    /// Calls f(record, partition) for positions a..=b, in order.
+    #[inline(always)]
+    fn for_range(&self, a: u64, b: u64, mut f: impl FnMut(&R, u32)) {
+        let mut k = self.starts.partition_point(|&x| x <= a) - 1;
+        let mut pos = a;
+        while pos <= b {
+            let (ptr, n, p) = self.chunks[k];
+            let off = (pos - self.starts[k]) as usize;
+            let end = ((b + 1 - self.starts[k]) as usize).min(n as usize);
+            let sl = unsafe { std::slice::from_raw_parts((ptr as *const R).add(off), end - off) };
+            for r in sl {
+                f(r, p);
+            }
+            pos += (end - off) as u64;
+            k += 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -460,7 +518,7 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     if nt > 16 || we - cws >= (1i64 << 31) || ctx.camp_ids.len() >= u16::MAX as usize - 1 || ctx.cat_names.len() > 255 {
         return None;
     }
-    let keys = recover_keys(ctx)?;
+    let keys = recover_keys(ctx, t0)?;
     let (ke, ku, kc) = (keys.e, keys.u, keys.c);
     tlog(t0, "keys recovered");
 
@@ -535,6 +593,11 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         s.pr.finish();
         s.cr.finish();
     }
+    // buffers per partition (pointer, length), for compaction in place after placement
+    let ebufs: Vec<Vec<(usize, usize)>> =
+        (0..le.np).map(|p| parsed.iter_mut().map(|s| (s.er.vecs[p].as_mut_ptr() as usize, s.er.vecs[p].len())).collect()).collect();
+    let cbufs: Vec<Vec<(usize, usize)>> =
+        (0..lc.np).map(|p| parsed.iter_mut().map(|s| (s.cr.vecs[p].as_mut_ptr() as usize, s.cr.vecs[p].len())).collect()).collect();
     let parsed = parsed;
     tlog(t0, "events and clicks parsed");
     if pk.failed() || parsed.iter().any(|s| s.bad) {
@@ -547,7 +610,8 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     }
     let person_of = |uid: u64| -> u64 {
         let r = if cm.maybe(uid) { cm.get_linked(uid) } else { uid };
-        r & !(1u64 << 63)
+        // a root's word holds the per-person state (bit 63): its name is its own key
+        if r >> 63 != 0 { uid } else { r }
     };
     let side = |xs: u32, ev: bool| -> u64 {
         let s = &parsed[by_tid[((xs >> 27) & 15) as usize]];
@@ -555,100 +619,118 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         if ev { s.eside[i] } else { s.cside[i] }
     };
 
-    // ---- placement: dedup into the dense arrays and cut segments
-    let dense_e: Vec<R> = zeroed_vec(le.np << le.s);
-    let dense_c: Vec<R> = zeroed_vec(lc.np << lc.s);
-    let de = dense_e.as_ptr() as usize;
-    let dc = dense_c.as_ptr() as usize;
+    // ---- placement: per partition, dedup into a slot array (in cache), cut segments, and
+    // write the kept records back, compacted, over the partition's parse buffers
     let nitems = le.np + lc.np;
-    let placed: Vec<PlaceOut> = par_run(nt, nitems, PlaceOut::default, |out, it| {
-        if it < le.np {
-            let p = it;
-            let total: usize = parsed.iter().map(|s| s.er.vecs[p].len()).sum();
+    let slots = (1usize << le.s).max(1 << lc.s);
+    let ebufs = &ebufs;
+    let cbufs = &cbufs;
+    let placed: Vec<PlaceOut> = par_run(
+        nt,
+        nitems,
+        || PlaceOut { loc: vec![R::default(); slots], ..Default::default() },
+        |out, it| {
+            let ev = it < le.np;
+            let p = if ev { it } else { it - le.np };
+            let bufs = if ev { &ebufs[p] } else { &cbufs[p] };
+            let total: usize = bufs.iter().map(|b| b.1).sum();
             if total == 0 {
                 return;
             }
-            let base = p << le.s;
-            let sl = unsafe { std::slice::from_raw_parts_mut((de as *mut R).add(base), 1 << le.s) };
-            for s in parsed.iter() {
-                for r in &s.er.vecs[p] {
-                    let x = unsafe { sl.get_unchecked_mut((r.w1 & 0xffff) as usize) };
-                    if x.w0 == 0 || (r.w0 >> 32) < (x.w0 >> 32) {
-                        *x = *r;
+            let mut loc = std::mem::take(&mut out.loc);
+            if ev {
+                for &(ptr, n) in bufs {
+                    for r in unsafe { std::slice::from_raw_parts(ptr as *const R, n) } {
+                        let x = unsafe { loc.get_unchecked_mut((r.w1 & 0xffff) as usize) };
+                        if x.w0 == 0 || (r.w0 >> 32) < (x.w0 >> 32) {
+                            *x = *r;
+                        }
+                    }
+                }
+                for s in parsed.iter() {
+                    for r in &s.pr.vecs[p] {
+                        let x = unsafe { loc.get_unchecked_mut((r.w0 & 0xffff) as usize) };
+                        if x.w0 != 0 && (x.w1 >> 16) & 7 == 3 && x.w0 >> 32 == r.w0 >> 32 {
+                            x.w0 = (x.w0 & 0xffff_ffff) | (r.w1 << 32);
+                            x.w1 |= 1 << 18;
+                        }
+                    }
+                }
+            } else {
+                for &(ptr, n) in bufs {
+                    for r in unsafe { std::slice::from_raw_parts(ptr as *const R, n) } {
+                        let x = unsafe { loc.get_unchecked_mut((r.w0 >> 48) as usize) };
+                        if x.w0 == 0 {
+                            *x = *r;
+                        }
                     }
                 }
             }
-            for s in parsed.iter() {
-                for r in &s.pr.vecs[p] {
-                    let x = unsafe { sl.get_unchecked_mut((r.w0 & 0xffff) as usize) };
-                    if x.w0 != 0 && (x.w1 >> 16) & 7 == 3 && x.w0 >> 32 == r.w0 >> 32 {
-                        x.w0 = (x.w0 & 0xffff_ffff) | (r.w1 << 32);
-                        x.w1 |= 1 << 18;
-                    }
-                }
-            }
+            // kept records in index order -> segments, and compacted over the buffers
             let mut segs: Vec<Seg> = Vec::new();
-            for (i, x) in sl.iter().enumerate() {
-                if x.w0 == 0 || (x.w1 >> 16) & 1 == 0 {
-                    continue;
-                }
-                let uf = (x.w1 >> 32) as u32;
-                if uf & EXO != 0 {
-                    out.slow_e.push(se_of(*x, person_of(side(uf, true)), ws));
-                    continue;
-                }
-                let u = uf >> 9;
-                let gi = (base + i) as u32;
-                match segs.last_mut() {
-                    Some(g) if g.u == u => {
-                        g.end = gi;
-                        g.n += 1;
-                    }
-                    _ => segs.push(Seg { u, start: gi, end: gi, n: 1 }),
-                }
-            }
-            out.segs.push((p, segs));
-        } else {
-            let p = it - le.np;
-            let total: usize = parsed.iter().map(|s| s.cr.vecs[p].len()).sum();
-            if total == 0 {
-                return;
-            }
-            let base = p << lc.s;
-            let sl = unsafe { std::slice::from_raw_parts_mut((dc as *mut R).add(base), 1 << lc.s) };
-            for s in parsed.iter() {
-                for r in &s.cr.vecs[p] {
-                    let x = unsafe { sl.get_unchecked_mut((r.w0 >> 48) as usize) };
-                    if x.w0 == 0 {
-                        *x = *r;
-                    }
-                }
-            }
-            let mut segs: Vec<Seg> = Vec::new();
-            for (i, x) in sl.iter().enumerate() {
+            let (mut bi, mut bo) = (0usize, 0usize); // output buffer and offset
+            let mut m = 0u32;
+            let s_bits = if ev { le.s } else { lc.s };
+            for i in 0..1usize << s_bits {
+                let x = unsafe { *loc.get_unchecked(i) };
                 if x.w0 == 0 {
                     continue;
                 }
-                let uf = x.w1 as u32;
-                let gi = (base + i) as u32;
+                unsafe { *loc.get_unchecked_mut(i) = R::default() };
+                let uf = if ev {
+                    if (x.w1 >> 16) & 1 == 0 {
+                        continue; // the kept copy is invalid: the event is dropped
+                    }
+                    (x.w1 >> 32) as u32
+                } else {
+                    x.w1 as u32
+                };
                 if uf & EXO != 0 {
-                    let ts = cws + ((x.w0 >> 1) & 0x7fff_ffff) as i64;
-                    let cid = id_key(b'k', gi as u64, kc);
-                    out.slow_c.push(Ck { person: person_of(side(uf, false)), ts, cid, camp: (x.w0 >> 32) as u16 });
+                    if ev {
+                        out.slow_e.push(se_of(x, person_of(side(uf, true)), ws));
+                    } else {
+                        let ts = cws + ((x.w0 >> 1) & 0x7fff_ffff) as i64;
+                        let cid = id_key(b'k', ((p << lc.s) + i) as u64, kc);
+                        out.slow_c.push(Ck { person: person_of(side(uf, false)), ts, cid, camp: (x.w0 >> 32) as u16 });
+                    }
                     continue;
                 }
+                while bo == bufs[bi].1 {
+                    bi += 1;
+                    bo = 0;
+                }
+                unsafe { (bufs[bi].0 as *mut R).add(bo).write(x) };
+                bo += 1;
                 let u = uf >> 9;
                 match segs.last_mut() {
                     Some(g) if g.u == u => {
-                        g.end = gi;
+                        g.end = m;
                         g.n += 1;
                     }
-                    _ => segs.push(Seg { u, start: gi, end: gi, n: 1 }),
+                    _ => segs.push(Seg { u, start: m, end: m, n: 1 }),
                 }
+                m += 1;
             }
-            out.csegs.push((p, segs));
+            if ev {
+                out.segs.push((p, m as usize, segs));
+            } else {
+                out.csegs.push((p, m as usize, segs));
+            }
+            out.loc = loc;
+        },
+    );
+    let mut ekept = vec![0usize; le.np];
+    let mut ckept = vec![0usize; lc.np];
+    for o in &placed {
+        for x in &o.segs {
+            ekept[x.0] = x.1;
         }
-    });
+        for x in &o.csegs {
+            ckept[x.0] = x.1;
+        }
+    }
+    let (ecomp, efirst) = Comp::new(&ekept, ebufs);
+    let (ccomp, cfirst) = Comp::new(&ckept, cbufs);
     tlog(t0, "placed");
 
     // ---- IDs outside the scheme: dedup them alone (they never equal an ID inside it);
@@ -702,27 +784,29 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     }
 
     // ---- global segment lists; a user index in more than one segment is slow
-    let merge = |lists: Vec<&(usize, Vec<Seg>)>| -> Vec<Seg> {
+    // positions become global (start of the partition in the compacted concatenation)
+    let merge = |lists: Vec<&(usize, usize, Vec<Seg>)>, first: &[u64]| -> Vec<Seg> {
         let mut v: Vec<Seg> = Vec::new();
-        for (_, l) in lists {
+        for (p, _, l) in lists {
+            let f = first[*p] as u32;
             for g in l {
                 match v.last_mut() {
                     Some(h) if h.u == g.u => {
-                        h.end = g.end;
+                        h.end = g.end + f;
                         h.n += g.n;
                     }
-                    _ => v.push(*g),
+                    _ => v.push(Seg { u: g.u, start: g.start + f, end: g.end + f, n: g.n }),
                 }
             }
         }
         v
     };
-    let mut el: Vec<&(usize, Vec<Seg>)> = placed.iter().flat_map(|o| o.segs.iter()).collect();
+    let mut el: Vec<&(usize, usize, Vec<Seg>)> = placed.iter().flat_map(|o| o.segs.iter()).collect();
     el.sort_by_key(|x| x.0);
-    let mut esegs = merge(el);
-    let mut cl: Vec<&(usize, Vec<Seg>)> = placed.iter().flat_map(|o| o.csegs.iter()).collect();
+    let mut esegs = merge(el, &efirst);
+    let mut cl: Vec<&(usize, usize, Vec<Seg>)> = placed.iter().flat_map(|o| o.csegs.iter()).collect();
     cl.sort_by_key(|x| x.0);
-    let mut csegs = merge(cl);
+    let mut csegs = merge(cl, &cfirst);
     let ubits = 1usize << 22;
     let mut slow_u = vec![0u64; ubits / 64];
     let mut any_dup = false;
@@ -795,8 +879,9 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let slow_names = &slow_names;
     let esegs = &esegs;
     let csegs = &csegs;
-    let dense_e = &dense_e;
-    let dense_c = &dense_c;
+    let ecomp = &ecomp;
+    let ccomp = &ccomp;
+    let cs = lc.s;
     let ul = &ul;
     let p2: Vec<(AggState, Pass2)> = par_run(nt, nu, || (new_agg(), Pass2::default()), |(st, w), k| {
         let (lo, hi) = (ubound(k), ubound(k + 1));
@@ -830,7 +915,7 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             while m2 < ul.len() && ul[m2].u as u64 == u {
                 m2 += 1;
             }
-            do_user(st, w, u as u32, eseg, cseg, &ul[m..m2], dense_e, dense_c, slow_u, slow_names, ku, kc, ws, cws, day0, ndays, organic);
+            do_user(st, w, u as u32, eseg, cseg, &ul[m..m2], ecomp, ccomp, cs, slow_u, slow_names, ku, kc, ws, cws, day0, ndays, organic);
         }
     });
     tlog(t0, &format!("sessions done (in place); slow path gets {} events, {} clicks; {} user indexes in several segments",
@@ -935,62 +1020,57 @@ fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) ->
         *n += cm.finish_range(i * cap / nfin, (i + 1) * cap / nfin);
     });
     // A person whose IDs inside the scheme do not all decode to one user index is handled
-    // by the slow path:
-    // flag bit 63 on the name of every member. Linked IDs inside the scheme also go into a
-    // table sorted by user index, which pass 2 walks in order (no hash lookups there).
-    let ust: Vec<AtomicU64> = zeroed_vec(cap);
-    let roots: Vec<AtomicU64> = zeroed_vec(cap); // root slot << 32 | x_u (u32::MAX: outside)
+    // by the slow path. Per person, the user index seen so far is kept in its root slot's
+    // name word (a root's name is its own key, so the word is free): bit 63 | u, or
+    // MULTI. Readers of the map treat a value with bit 63 as "the name is the key".
     par_run(nt, nfin, || (), |_, i| {
         for s in i * cap / nfin..(i + 1) * cap / nfin {
             let k = cm.t[s][0].load(Relaxed);
             if k == 0 {
                 continue;
             }
-            let r = cm.find(s as u32) as usize;
             let xu = xu_of_key(k, ku);
-            roots[s].store((r as u64) << 32 | xu as u64, Relaxed);
             if xu == u32::MAX {
                 // outside the scheme: only matters if a row uses it (then that row's
                 // person is put in the slow set after placement)
                 continue;
             }
-            let enc = (xu >> 9) as u64 + 1;
-            let mut cur = ust[r].load(Relaxed);
+            let r = cm.find(s as u32) as usize;
+            let enc = 1u64 << 63 | (xu >> 9) as u64;
+            let w = &cm.t[r][1];
+            let mut cur = w.load(Relaxed);
             loop {
                 if cur == enc || cur == MULTI {
                     break;
                 }
-                if cur == 0 {
-                    match ust[r].compare_exchange(0, enc, Relaxed, Relaxed) {
+                if cur >> 63 == 0 {
+                    match w.compare_exchange(cur, enc, Relaxed, Relaxed) {
                         Ok(_) => break,
                         Err(x) => cur = x,
                     }
                 } else {
-                    ust[r].store(MULTI, Relaxed);
+                    w.store(MULTI, Relaxed);
                     break;
                 }
             }
         }
     });
+    // linked IDs inside the scheme, with their person's name and flag, sorted by user index
+    // (pass 2 walks this table in order: no hash lookups there)
     let ul_parts: Vec<Vec<Ul>> = par_run(nt, nfin, Vec::new, |out, i| {
         for s in i * cap / nfin..(i + 1) * cap / nfin {
             let k = cm.t[s][0].load(Relaxed);
             if k == 0 {
                 continue;
             }
-            let rx = roots[s].load(Relaxed);
-            let (r, xu) = ((rx >> 32) as usize, rx as u32);
-            let multi = ust[r].load(Relaxed) == MULTI;
-            if multi {
-                // the flag must be seen for every member, including the root (whose name
-                // is itself, so `finish_range` left it out of the filter)
-                cm.t[s][1].fetch_or(1 << 63, Relaxed);
-                cm.set_filter(k);
+            let xu = xu_of_key(k, ku);
+            if xu == u32::MAX {
+                continue;
             }
-            if xu != u32::MAX {
-                let name = cm.t[s][1].load(Relaxed) & !(1u64 << 63);
-                out.push(Ul { u: xu >> 9, alias: xu & 511, name: name | (multi as u64) << 63 });
-            }
+            let r = cm.find(s as u32) as usize;
+            let name = cm.t[r][0].load(Relaxed);
+            let multi = cm.t[r][1].load(Relaxed) == MULTI;
+            out.push(Ul { u: xu >> 9, alias: xu & 511, name: name | (multi as u64) << 63 });
         }
     });
     let mut ul: Vec<Ul> = Vec::with_capacity(ul_parts.iter().map(|v| v.len()).sum());
@@ -1001,8 +1081,6 @@ fn build_links<P: Packer>(ctx: &Ctx, pk: &P, ku: u64, check: bool, nt: usize) ->
         let mut tmp = Vec::new();
         radix_sort_u32(&mut ul, &mut tmp, |e| e.u);
     }
-    drop(roots);
-    drop(ust);
     Some((cm, ul))
 }
 
@@ -1030,8 +1108,9 @@ fn do_user(
     eseg: Option<Seg>,
     cseg: Option<Seg>,
     links: &[Ul],
-    dense_e: &[R],
-    dense_c: &[R],
+    ecomp: &Comp,
+    ccomp: &Comp,
+    cs: u32,
     slow_u: &[u64],
     slow_names: &HashSet<u64, BuildHasherDefault<Fx>>,
     ku: u64,
@@ -1080,11 +1159,8 @@ fn do_user(
         w.eci.reserve(n);
         let (pe, pi) = (w.evs.as_mut_ptr(), w.eci.as_mut_ptr());
         let mut k = 0usize;
-        for x in &dense_e[g.start as usize..=g.end as usize] {
-            // the same records the segment counted: kept, valid, user inside the scheme
-            if x.w0 == 0 || (x.w1 >> 16) & 1 == 0 || (x.w1 >> 63) != 0 || k == n {
-                continue;
-            }
+        // compacted records: kept, valid, user inside the scheme
+        ecomp.for_range(g.start as u64, g.end as u64, |x, _| {
             let uf = (x.w1 >> 32) as u32;
             let a = unsafe { *w.aidx.get_unchecked((uf & 511) as usize) };
             let ci = if a.0 == stamp { a.1 } else { resolve(w, uf & 511) };
@@ -1094,12 +1170,14 @@ fn do_user(
             sorted &= ts >= prev;
             prev = ts;
             let ev = Ev2 { ts, pc: if purchase { (pc & 0xff_ffff) | (pc >> 24) << 32 | 1 << 48 } else { 0 } };
-            unsafe {
-                pe.add(k).write(ev);
-                pi.add(k).write(ci);
+            if k < n {
+                unsafe {
+                    pe.add(k).write(ev);
+                    pi.add(k).write(ci);
+                }
+                k += 1;
             }
-            k += 1;
-        }
+        });
         unsafe {
             w.evs.set_len(k);
             w.eci.set_len(k);
@@ -1109,17 +1187,15 @@ fn do_user(
         let n = g.n as usize;
         w.cks.reserve(n);
         w.cci.reserve(n);
-        for (o, x) in dense_c[g.start as usize..=g.end as usize].iter().enumerate() {
-            if x.w0 == 0 || x.w1 as u32 & EXO != 0 {
-                continue;
-            }
+        ccomp.for_range(g.start as u64, g.end as u64, |x, p| {
             let uf = x.w1 as u32;
             let a = unsafe { *w.aidx.get_unchecked((uf & 511) as usize) };
             let ci = if a.0 == stamp { a.1 } else { resolve(w, uf & 511) };
             let ts = cws + ((x.w0 >> 1) & 0x7fff_ffff) as i64;
-            w.cks.push(Ck { person: 0, ts, cid: g.start as u64 + o as u64, camp: (x.w0 >> 32) as u16 });
+            let xc = ((p as u64) << cs) | (x.w0 >> 48);
+            w.cks.push(Ck { person: 0, ts, cid: xc, camp: (x.w0 >> 32) as u16 });
             w.cci.push(ci);
-        }
+        });
     }
     let nc = w.cache.len();
     if nc == 0 {

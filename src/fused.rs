@@ -129,11 +129,6 @@ impl CMap {
     fn fpos(&self, k: u64) -> usize {
         (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> self.fshift) as usize
     }
-    /// Makes `maybe(k)` true (for keys whose stored name carries a flag).
-    pub(crate) fn set_filter(&self, k: u64) {
-        let b = self.fpos(k);
-        self.filt[b >> 6].fetch_or(1 << (b & 63), Relaxed);
-    }
     #[inline(always)]
     pub(crate) fn maybe(&self, k: u64) -> bool {
         let b = self.fpos(k);
