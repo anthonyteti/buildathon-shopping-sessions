@@ -19,6 +19,12 @@ impl<T: Copy + Default, const K: usize> Scatter<T, K> {
         }
     }
 
+    /// Records in partition p so far (including the staged ones).
+    #[inline(always)]
+    pub fn len(&self, p: usize) -> usize {
+        unsafe { self.vecs.get_unchecked(p).len() + *self.cnt.get_unchecked(p) as usize }
+    }
+
     #[inline(always)]
     pub fn push(&mut self, p: usize, v: T) {
         let c = unsafe { *self.cnt.get_unchecked(p) } as usize;

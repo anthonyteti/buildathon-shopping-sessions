@@ -16,6 +16,7 @@
 
 mod arena;
 mod fastpath;
+mod fused;
 mod parquet_out;
 mod scan;
 mod scatter;
@@ -961,6 +962,12 @@ fn group_partition<'a>(
             s.sort_unstable_by_key(|e| e.ts);
         }
     }
+    group_clicks(g, mask, cks_in);
+}
+
+/// Clicks of the persons grouped in `g` (table `g.tab` with `mask`), sorted by (ts, click_id).
+fn group_clicks<'a>(g: &mut Group, mask: usize, cks_in: impl Iterator<Item = &'a [Ck]> + Clone) {
+    let nl = g.off.len() - 1;
     // clicks of persons with events in this partition
     g.coff.clear();
     g.coff.resize(nl + 1, 0);
@@ -1465,9 +1472,22 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     );
     tlog(t0, "sessions done");
 
-    // ---- output
+    write_output(ctx, pk, &aggs, ndays, day0);
+    tlog(t0, "output written");
+    if std::env::var_os("SS_DROP_TIMING").is_some() {
+        drop(aggs);
+        drop(deduped);
+        drop(parsed);
+        tlog(t0, "freed (timing only)");
+    }
+    Some(())
+}
+
+/// Sums the per-thread campaign counters and writes both tables.
+fn write_output<P: Packer>(ctx: &Ctx, pk: &P, aggs: &[AggState], ndays: usize, day0: i64) {
+    let ncamp = ctx.camp_ids.len();
     let mut camp = vec![0i64; (ncamp + 1) * ndays * 4];
-    for a in &aggs {
+    for a in aggs {
         for (x, y) in camp.iter_mut().zip(a.camp.iter()) {
             *x += *y;
         }
@@ -1491,14 +1511,6 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             parquet_out::write_campaign_daily(&path, camp, ndays, day0, &ctx.camp_ids, &ctx.camp_channels)
         });
     });
-    tlog(t0, "output written");
-    if std::env::var_os("SS_DROP_TIMING").is_some() {
-        drop(aggs);
-        drop(deduped);
-        drop(parsed);
-        tlog(t0, "freed (timing only)");
-    }
-    Some(())
 }
 
 #[inline(always)]
@@ -1882,7 +1894,14 @@ fn main() {
     let p7 = Pack7 { fail: AtomicBool::new(false) };
     // SS_FORCE_RANK=1 forces the fallback key path (used by the tests).
     let force_rank = std::env::var_os("SS_FORCE_RANK").is_some();
-    if force_rank || run(&ctx, &p7, &t0).is_none() {
+    let use_fused = std::env::var_os("SS_GENERAL").is_none();
+    let done = !force_rank && ((use_fused && fused::run_fused(&ctx, &p7, &t0).is_some()) || {
+        if use_fused {
+            eprintln!("outside the fast path's limits; running the general pipeline");
+        }
+        run(&ctx, &Pack7 { fail: AtomicBool::new(false) }, &t0).is_some()
+    });
+    if !done {
         eprintln!("an ID does not fit the packed key; rerunning with ranked keys");
         let rp = build_rank(&ctx);
         tlog(&t0, "rank table built");
