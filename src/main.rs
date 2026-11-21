@@ -15,6 +15,7 @@
 //! the whole run is redone with keys that are ranks in the sorted set of all IDs.
 
 mod parquet_out;
+mod scan;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -204,8 +205,21 @@ fn parse_price(f: &[u8]) -> Option<u32> {
 pub trait Packer: Sync {
     /// Non-empty ID -> non-zero key. Equality and order of keys equal those of the bytes.
     fn pack(&self, f: &[u8]) -> u64;
+    /// Same as `pack`, but `f` must have at least 16 readable bytes from its start.
+    #[inline(always)]
+    unsafe fn pack_padded(&self, f: &[u8]) -> u64 {
+        self.pack(f)
+    }
     fn unpack(&self, k: u64, out: &mut Vec<u8>);
     fn failed(&self) -> bool;
+}
+
+/// Big-endian word of eight 7-bit bytes -> their 56 bits, most significant first.
+#[inline(always)]
+fn compress7(w: u64) -> u64 {
+    let x = (w & 0x007f_007f_007f_007f) | ((w & 0x7f00_7f00_7f00_7f00) >> 1);
+    let x = (x & 0x0000_3fff_0000_3fff) | ((x & 0x3fff_0000_3fff_0000) >> 2);
+    (x & 0x0fff_ffff) | ((x & 0x0fff_ffff_0000_0000) >> 4)
 }
 
 /// Up to 9 bytes, each 1..=127, 7 bits each, big-endian, zero-padded.
@@ -233,6 +247,31 @@ impl Packer for Pack7 {
             return 1;
         }
         k
+    }
+    #[inline(always)]
+    unsafe fn pack_padded(&self, f: &[u8]) -> u64 {
+        let n = f.len();
+        if n == 0 {
+            return 0;
+        }
+        if n > 9 {
+            self.fail.store(true, Relaxed);
+            return 1;
+        }
+        let raw = u64::from_le(unsafe { (f.as_ptr() as *const u64).read_unaligned() });
+        let lo = n.min(8);
+        let mask = if lo == 8 { u64::MAX } else { (1u64 << (8 * lo)) - 1 };
+        let w = raw & mask;
+        let b8 = if n == 9 { (unsafe { *f.get_unchecked(8) }) as u64 } else { 0 };
+        let probe = w | (!mask & 0x0101_0101_0101_0101);
+        let high = w & 0x8080_8080_8080_8080 != 0;
+        let zero = probe.wrapping_sub(0x0101_0101_0101_0101) & !probe & 0x8080_8080_8080_8080 != 0;
+        let bad9 = n == 9 && (b8 == 0 || b8 >= 0x80);
+        if high | zero | bad9 {
+            self.fail.store(true, Relaxed);
+            return 1;
+        }
+        (compress7(w.swap_bytes()) << 7) | b8
     }
     fn unpack(&self, k: u64, out: &mut Vec<u8>) {
         for j in 0..9 {
@@ -270,41 +309,54 @@ impl Packer for RankPack {
 
 // ---------------------------------------------------------------- person map
 
-/// Open addressing u64 -> u64 (key 0 = empty). Holds only IDs whose person name differs.
-struct PersonMap {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// Open addressing ID key -> person name key (key 0 = empty). Holds only IDs whose
+/// name differs from themselves; every other ID is its own person.
+pub struct PersonMap {
+    t: Vec<[u64; 2]>,
     mask: usize,
 }
 impl PersonMap {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        PersonMap { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1 }
+        PersonMap { t: vec![[0, 0]; cap], mask: cap - 1 }
     }
     fn insert(&mut self, k: u64, v: u64) {
         let mut i = mix(k) as usize & self.mask;
         loop {
-            if self.keys[i] == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
-                return;
-            }
-            if self.keys[i] == k {
-                self.vals[i] = v;
+            if self.t[i][0] == 0 || self.t[i][0] == k {
+                self.t[i] = [k, v];
                 return;
             }
             i = (i + 1) & self.mask;
         }
     }
     #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        prefetch(self.t.as_ptr().wrapping_add(mix(k) as usize & self.mask));
+    }
+    #[inline(always)]
     fn get(&self, k: u64) -> u64 {
         let mut i = mix(k) as usize & self.mask;
         loop {
-            let s = self.keys[i];
-            if s == k {
-                return self.vals[i];
+            let s = unsafe { *self.t.get_unchecked(i) };
+            if s[0] == k {
+                return s[1];
             }
-            if s == 0 {
+            if s[0] == 0 {
                 return k;
             }
             i = (i + 1) & self.mask;
@@ -312,55 +364,95 @@ impl PersonMap {
     }
 }
 
-fn build_persons(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
-    let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut keys: Vec<u64> = Vec::with_capacity(total * 2);
-    for v in pairs {
-        for &(a, b) in v {
-            keys.push(a);
-            keys.push(b);
+/// Union-find over link endpoints. IDs get dense indices through a growable hash table;
+/// every union keeps the root with the smaller key, so a root is its person's name.
+struct Uf {
+    t: Vec<(u64, u32)>,
+    mask: usize,
+    keyof: Vec<u64>,
+    parent: Vec<u32>,
+}
+impl Uf {
+    fn with_capacity(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(1024);
+        Uf { t: vec![(0, 0); cap], mask: cap - 1, keyof: Vec::with_capacity(n), parent: Vec::with_capacity(n) }
+    }
+    fn grow(&mut self) {
+        let cap = self.t.len() * 2;
+        let old = std::mem::replace(&mut self.t, vec![(0, 0); cap]);
+        self.mask = cap - 1;
+        for (k, v) in old {
+            if k != 0 {
+                let mut i = mix(k) as usize & self.mask;
+                while self.t[i].0 != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.t[i] = (k, v);
+            }
         }
     }
-    keys.sort_unstable();
-    keys.dedup();
-    let n = keys.len();
-    let mut idx: FxMap<u64, u32> = FxMap::default();
-    idx.reserve(n);
-    for (i, &k) in keys.iter().enumerate() {
-        idx.insert(k, i as u32);
+    #[inline(always)]
+    fn id(&mut self, k: u64) -> u32 {
+        let mut i = mix(k) as usize & self.mask;
+        loop {
+            let s = self.t[i];
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == 0 {
+                let id = self.keyof.len() as u32;
+                self.t[i] = (k, id);
+                self.keyof.push(k);
+                self.parent.push(id);
+                if self.keyof.len() * 10 > self.t.len() * 7 {
+                    self.grow();
+                }
+                return id;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            let gp = p[p[x as usize] as usize];
-            p[x as usize] = gp;
+    #[inline(always)]
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let gp = self.parent[self.parent[x as usize] as usize];
+            self.parent[x as usize] = gp;
             x = gp;
         }
         x
     }
+}
+
+fn build_persons(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
+    let total: usize = pairs.iter().map(|v| v.len()).sum();
+    let mut uf = Uf::with_capacity(total + total / 2);
     for v in pairs {
         for &(a, b) in v {
-            let ra = find(&mut parent, idx[&a]);
-            let rb = find(&mut parent, idx[&b]);
-            if ra < rb {
-                parent[rb as usize] = ra;
-            } else if rb < ra {
-                parent[ra as usize] = rb;
+            let ia = uf.id(a);
+            let ib = uf.id(b);
+            let ra = uf.find(ia);
+            let rb = uf.find(ib);
+            if ra != rb {
+                if uf.keyof[ra as usize] < uf.keyof[rb as usize] {
+                    uf.parent[rb as usize] = ra;
+                } else {
+                    uf.parent[ra as usize] = rb;
+                }
             }
         }
     }
+    let n = uf.keyof.len() as u32;
     let mut changed = 0;
-    for i in 0..n as u32 {
-        if find(&mut parent, i) != i {
+    for i in 0..n {
+        if uf.find(i) != i {
             changed += 1;
         }
     }
     let mut pm = PersonMap::new(changed);
-    for i in 0..n as u32 {
-        let r = find(&mut parent, i);
+    for i in 0..n {
+        let r = uf.find(i);
         if r != i {
-            // the root is the smallest index of its component = the byte-wise smallest ID
-            pm.insert(keys[i as usize], keys[r as usize]);
+            pm.insert(uf.keyof[i as usize], uf.keyof[r as usize]);
         }
     }
     pm
@@ -478,6 +570,7 @@ pub struct Ctx {
     events: Vec<Mmap>,
     clicks: Vec<Mmap>,
     out_dir: PathBuf,
+    check_split: bool,
 }
 
 // ---------------------------------------------------------------- parallel helper
@@ -506,15 +599,15 @@ fn par_run<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(nt: usize,
 
 // ---------------------------------------------------------------- records
 
-#[derive(Clone, Copy)]
+/// One parsed event copy (32 bytes).
+/// meta = ingest seconds (48 bits, offset by 2^47 from window start) << 16 | category.
+/// tp   = (ts - window_start) ms << 26 | price << 2 | flags (1 = valid, 2 = purchase).
+#[derive(Clone, Copy, Default)]
 struct Ev {
     eid: u64,
-    ingest: i64,
-    person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    flags: u8, // 1 = valid, 2 = purchase
+    uid: u64,
+    meta: u64,
+    tp: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -543,23 +636,34 @@ pub struct UdRow {
     pub top: u16, // u16::MAX = null
 }
 
-const P1_BITS: u32 = 9;
-const P2_BITS: u32 = 9;
-const P1: usize = 1 << P1_BITS;
-const P2: usize = 1 << P2_BITS;
-
-#[inline(always)]
-fn part1(k: u64) -> usize {
-    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P1_BITS)) as usize
+#[derive(Clone, Copy)]
+struct Parts {
+    bits: u32,
 }
-#[inline(always)]
-fn part2(k: u64) -> usize {
-    (k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) >> (64 - P2_BITS)) as usize
+impl Parts {
+    #[inline(always)]
+    fn n(self) -> usize {
+        1 << self.bits
+    }
+    #[inline(always)]
+    fn by_eid(self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize
+    }
+    #[inline(always)]
+    fn by_person(self, k: u64) -> usize {
+        (k.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) >> (64 - self.bits)) as usize
+    }
 }
 
 struct ParseState {
     ev: Vec<Vec<Ev>>,
     ck: Vec<Vec<Ck>>,
+}
+
+struct DedupState {
+    out: Vec<Vec<Se>>,
+    table: Vec<Ev>,
+    surv: Vec<Ev>,
 }
 
 struct AggState {
@@ -570,18 +674,196 @@ struct AggState {
     ccount: Vec<u32>,
     cpos: Vec<u32>,
     active: Vec<u16>,
+    g: Group,
+}
+
+/// One person partition, grouped: events of local person l are evs[off[l]..off[l+1]],
+/// sorted by ts; their clicks are cks[coff[l]..coff[l+1]], sorted by (ts, click_id).
+#[derive(Default)]
+struct Group {
+    tab: Vec<(u64, u32)>,
+    lid: Vec<u32>,
+    off: Vec<u32>,
+    pos: Vec<u32>,
+    evs: Vec<Se>,
+    coff: Vec<u32>,
+    clid: Vec<u32>,
+    cks: Vec<Ck>,
+}
+
+fn group_partition<'a>(
+    g: &mut Group,
+    n: usize,
+    evs_in: impl Iterator<Item = &'a [Se]> + Clone,
+    cks_in: impl Iterator<Item = &'a [Ck]> + Clone,
+) {
+    let cap = (n * 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    g.tab.clear();
+    g.tab.resize(cap, (0, 0));
+    g.lid.clear();
+    g.off.clear();
+    for part in evs_in.clone() {
+        for e in part {
+            let mut i = mix(e.person) as usize & mask;
+            let l = loop {
+                let s = g.tab[i];
+                if s.0 == e.person {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    let l = g.off.len() as u32;
+                    g.tab[i] = (e.person, l);
+                    g.off.push(0);
+                    break l;
+                }
+                i = (i + 1) & mask;
+            };
+            g.off[l as usize] += 1;
+            g.lid.push(l);
+        }
+    }
+    let nl = g.off.len();
+    let mut acc = 0u32;
+    for x in g.off.iter_mut() {
+        let c = *x;
+        *x = acc;
+        acc += c;
+    }
+    g.off.push(acc);
+    g.pos.clear();
+    g.pos.extend_from_slice(&g.off[..nl]);
+    g.evs.clear();
+    g.evs.resize(n, Se { person: 0, ts: 0, price: 0, cat: 0, purchase: false });
+    let mut k = 0;
+    for part in evs_in {
+        for e in part {
+            let l = g.lid[k] as usize;
+            g.evs[g.pos[l] as usize] = *e;
+            g.pos[l] += 1;
+            k += 1;
+        }
+    }
+    for l in 0..nl {
+        let s = &mut g.evs[g.off[l] as usize..g.off[l + 1] as usize];
+        if s.len() > 1 {
+            s.sort_unstable_by_key(|e| e.ts);
+        }
+    }
+    // clicks of persons with events in this partition
+    g.coff.clear();
+    g.coff.resize(nl + 1, 0);
+    g.clid.clear();
+    for part in cks_in.clone() {
+        for c in part {
+            let mut i = mix(c.person) as usize & mask;
+            let l = loop {
+                let s = g.tab[i];
+                if s.0 == c.person {
+                    break s.1;
+                }
+                if s.0 == 0 {
+                    break u32::MAX;
+                }
+                i = (i + 1) & mask;
+            };
+            if l != u32::MAX {
+                g.coff[l as usize] += 1;
+            }
+            g.clid.push(l);
+        }
+    }
+    let mut acc = 0u32;
+    for x in g.coff.iter_mut() {
+        let c = *x;
+        *x = acc;
+        acc += c;
+    }
+    g.pos.clear();
+    g.pos.extend_from_slice(&g.coff[..nl]);
+    g.cks.clear();
+    g.cks.resize(acc as usize, Ck { person: 0, ts: 0, cid: 0, camp: 0 });
+    let mut k = 0;
+    for part in cks_in {
+        for c in part {
+            let l = g.clid[k];
+            k += 1;
+            if l != u32::MAX {
+                g.cks[g.pos[l as usize] as usize] = *c;
+                g.pos[l as usize] += 1;
+            }
+        }
+    }
+    for l in 0..nl {
+        let s = &mut g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
+        if s.len() > 1 {
+            s.sort_unstable_by_key(|c| (c.ts, c.cid));
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the pipeline
 
-fn tlog(t0: &Instant, what: &str) {
-    eprintln!("[{:8.1} ms] {what}", t0.elapsed().as_secs_f64() * 1e3);
+fn cpu_ms() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let tv = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+    tv(ru.ru_utime) + tv(ru.ru_stime)
 }
+
+fn tlog(t0: &Instant, what: &str) {
+    eprintln!("[{:8.1} ms] [cpu {:8.1} ms] {what}", t0.elapsed().as_secs_f64() * 1e3, cpu_ms());
+}
+
+/// Calls `f` with the fields of every well-formed line in file[start..end] (N fields).
+/// Every field handed to `f` has at least 16 readable bytes from its start.
+#[inline(always)]
+fn scan_lines<const N: usize>(file: &[u8], start: usize, end: usize, check: bool, mut f: impl FnMut(&[&[u8]; N])) {
+    let mut pos = start;
+    let fast_end = file.len().saturating_sub(scan::FAST_SLACK);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out: [&[u8]; N] = [b""; N];
+    while pos < end {
+        if pos <= fast_end {
+            let (nl, cm, qm) = unsafe { scan::masks128(file.as_ptr().add(pos)) };
+            if nl != 0 {
+                let len = nl.trailing_zeros() as usize;
+                let line = unsafe { file.get_unchecked(pos..pos + len) };
+                let ok = scan::fields::<N>(line, cm, qm, &mut out);
+                if check {
+                    let mut o2: [&[u8]; N] = [b""; N];
+                    let ok2 = split::<N>(line, &mut o2);
+                    assert!(ok == ok2 && (!ok || out == o2), "splitters disagree on {:?}", String::from_utf8_lossy(line));
+                }
+                if ok {
+                    f(&out);
+                }
+                pos += len + 1;
+                continue;
+            }
+        }
+        let e = memchr::memchr(b'\n', &file[pos..end]).map_or(end, |i| pos + i);
+        buf.clear();
+        buf.extend_from_slice(&file[pos..e]);
+        buf.extend_from_slice(&[0u8; 16]);
+        let line = &buf[..e - pos];
+        let mut o: [&[u8]; N] = [b""; N];
+        if split::<N>(line, &mut o) {
+            f(&o);
+        }
+        pos = e + 1;
+    }
+}
+
+const INGEST_OFF: i64 = 1 << 47;
 
 /// Returns None when the packer reports an ID it cannot represent.
 fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let nt = ctx.nthreads;
     let (ws, we) = (ctx.ws, ctx.we);
+    let ws_s = ws.div_euclid(1000);
+    let check = ctx.check_split;
+    assert!(we - ws < (1i64 << 38), "event window too long");
 
     // ---- links
     let mut lchunks = Vec::new();
@@ -589,12 +871,10 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     lchunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
     let pairs: Vec<Vec<(u64, u64)>> = par_run(nt, lchunks.len(), Vec::new, |st: &mut Vec<(u64, u64)>, i| {
         let c = lchunks[i];
-        let d = &ctx.links[c.file as usize][c.start..c.end];
-        let mut f: [&[u8]; 2] = [b""; 2];
-        for_lines(d, |line| {
-            if split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                let a = pk.pack(f[0]);
-                let b = pk.pack(f[1]);
+        scan_lines::<2>(&ctx.links[c.file as usize], c.start, c.end, check, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                let a = unsafe { pk.pack_padded(f[0]) };
+                let b = unsafe { pk.pack_padded(f[1]) };
                 if a != b {
                     st.push((a, b));
                 }
@@ -602,31 +882,51 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         });
     });
     tlog(t0, "links parsed");
-    let persons = build_persons(&pairs);
-    tlog(t0, "persons built");
 
-    // ---- events + clicks
-    let mut chunks = Vec::new();
-    make_chunks(&ctx.events, 1, 8 << 20, &mut chunks);
-    make_chunks(&ctx.clicks, 2, 8 << 20, &mut chunks);
-    chunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    // ---- events + clicks (one worker first builds the person map; clicks wait for it)
+    let ev_bytes: usize = ctx.events.iter().map(|m| m.len()).sum();
+    let ck_bytes: usize = ctx.clicks.iter().map(|m| m.len()).sum();
+    let est_events = ev_bytes / 70 + 1;
+    let mut bits = 8u32;
+    while bits < 11 && (est_events >> bits) > 16_384 {
+        bits += 1;
+    }
+    let parts = Parts { bits };
+    let np = parts.n();
+    let ev_res = est_events * 6 / 5 / (nt * np) + 8;
+    let ck_res = (ck_bytes / 45) * 6 / 5 / (nt * np) + 8;
+    let mut items = vec![Chunk { kind: 3, file: 0, start: 0, end: 0 }];
+    let mut evc = Vec::new();
+    make_chunks(&ctx.events, 1, 8 << 20, &mut evc);
+    evc.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    let mut ckc = Vec::new();
+    make_chunks(&ctx.clicks, 2, 8 << 20, &mut ckc);
+    ckc.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    items.extend(evc);
+    items.extend(ckc);
     let cws = ws - WEEK;
+    let persons: std::sync::OnceLock<PersonMap> = std::sync::OnceLock::new();
     let parsed: Vec<ParseState> = par_run(
         nt,
-        chunks.len(),
-        || ParseState { ev: (0..P1).map(|_| Vec::new()).collect(), ck: (0..P2).map(|_| Vec::new()).collect() },
+        items.len(),
+        || ParseState {
+            ev: (0..np).map(|_| Vec::with_capacity(ev_res)).collect(),
+            ck: (0..np).map(|_| Vec::with_capacity(ck_res)).collect(),
+        },
         |st, i| {
-            let c = chunks[i];
-            if c.kind == 1 {
-                let d = &ctx.events[c.file as usize][c.start..c.end];
-                let mut f: [&[u8]; 7] = [b""; 7];
-                for_lines(d, |line| {
-                    if !split(line, &mut f) || f[0].is_empty() {
+            let c = items[i];
+            if c.kind == 3 {
+                let _ = persons.set(build_persons(&pairs));
+                tlog(t0, "persons built");
+            } else if c.kind == 1 {
+                scan_lines::<7>(&ctx.events[c.file as usize], c.start, c.end, check, |f| {
+                    if f[0].is_empty() {
                         return;
                     }
-                    let eid = pk.pack(f[0]);
+                    let eid = unsafe { pk.pack_padded(f[0]) };
                     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                    let mut rec = Ev { eid, ingest, person: 0, ts: 0, price: 0, cat: 0, flags: 0 };
+                    let ing_s = (ingest.div_euclid(1000) - ws_s).clamp(-INGEST_OFF, INGEST_OFF - 1) + INGEST_OFF;
+                    let mut rec = Ev { eid, uid: 0, meta: (ing_s as u64) << 16, tp: 0 };
                     'v: {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
@@ -640,27 +940,41 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                             b"purchase" => true,
                             _ => break 'v,
                         };
+                        let mut price = 0u32;
                         if purchase {
                             match parse_price(f[6]) {
-                                Some(p) => rec.price = p,
+                                Some(p) => price = p,
                                 None => break 'v,
                             }
-                            rec.cat = *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat);
+                            rec.meta |= *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat) as u64;
                         }
                         if ingest.saturating_sub(ts) > DAY {
                             break 'v;
                         }
-                        rec.ts = ts;
-                        rec.person = persons.get(pk.pack(f[1]));
-                        rec.flags = 1 | if purchase { 2 } else { 0 };
+                        rec.uid = unsafe { pk.pack_padded(f[1]) };
+                        rec.tp = ((ts - ws) as u64) << 26 | (price as u64) << 2 | 1 | if purchase { 2 } else { 0 };
                     }
-                    st.ev[part1(eid)].push(rec);
+                    st.ev[parts.by_eid(eid)].push(rec);
                 });
             } else {
-                let d = &ctx.clicks[c.file as usize][c.start..c.end];
-                let mut f: [&[u8]; 4] = [b""; 4];
-                for_lines(d, |line| {
-                    if !split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+                let pm = loop {
+                    if let Some(p) = persons.get() {
+                        break p;
+                    }
+                    std::thread::yield_now();
+                };
+                const B: usize = 16;
+                let mut pend = [(0u64, 0i64, 0u64, 0u16); B];
+                let mut n = 0usize;
+                let ck = &mut st.ck;
+                let flush = |pend: &[(u64, i64, u64, u16)], ck: &mut Vec<Vec<Ck>>| {
+                    for &(uid, ts, cid, camp) in pend {
+                        let person = pm.get(uid);
+                        ck[parts.by_person(person)].push(Ck { person, ts, cid, camp });
+                    }
+                };
+                scan_lines::<4>(&ctx.clicks[c.file as usize], c.start, c.end, check, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
                     let Some(&camp) = ctx.campaigns.get(f[2]) else { return };
@@ -668,10 +982,17 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         Some(t) if t >= cws && t < we => t,
                         _ => return,
                     };
-                    let cid = pk.pack(f[0]);
-                    let person = persons.get(pk.pack(f[1]));
-                    st.ck[part2(person)].push(Ck { person, ts, cid, camp });
+                    let cid = unsafe { pk.pack_padded(f[0]) };
+                    let uid = unsafe { pk.pack_padded(f[1]) };
+                    pm.prefetch(uid);
+                    pend[n] = (uid, ts, cid, camp);
+                    n += 1;
+                    if n == B {
+                        flush(&pend, ck);
+                        n = 0;
+                    }
                 });
+                flush(&pend[..n], ck);
             }
         },
     );
@@ -679,36 +1000,61 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     if pk.failed() {
         return None;
     }
+    let persons = persons.get().expect("person map");
 
-    // ---- dedup per event_id partition
-    let deduped: Vec<Vec<Vec<Se>>> = par_run(
+    // ---- dedup per event_id partition: keep the copy with the smallest ingest_ts
+    let se_res = est_events * 6 / 5 / (nt * np) + 8;
+    let deduped: Vec<DedupState> = par_run(
         nt,
-        P1,
-        || (0..P2).map(|_| Vec::new()).collect::<Vec<Vec<Se>>>(),
-        |out, p| {
+        np,
+        || DedupState { out: (0..np).map(|_| Vec::with_capacity(se_res)).collect(), table: Vec::new(), surv: Vec::new() },
+        |st, p| {
             let total: usize = parsed.iter().map(|s| s.ev[p].len()).sum();
-            let mut v: Vec<Ev> = Vec::with_capacity(total);
+            let cap = (total * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            st.table.clear();
+            st.table.resize(cap, Ev::default());
+            let t = &mut st.table;
             for s in &parsed {
-                v.extend_from_slice(&s.ev[p]);
+                for &e in &s.ev[p] {
+                    let mut i = (mix(e.eid) as usize) & mask;
+                    loop {
+                        let x = unsafe { t.get_unchecked_mut(i) };
+                        if x.eid == 0 {
+                            *x = e;
+                            break;
+                        }
+                        if x.eid == e.eid {
+                            if (e.meta >> 16) < (x.meta >> 16) {
+                                *x = e;
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
+                    }
+                }
             }
-            v.sort_unstable_by_key(|e| (e.eid, e.ingest));
-            let mut i = 0;
-            while i < v.len() {
-                let e = v[i];
-                let mut j = i + 1;
-                while j < v.len() && v[j].eid == e.eid {
-                    j += 1;
+            st.surv.clear();
+            for x in t.iter() {
+                if x.tp & 1 != 0 {
+                    st.surv.push(*x);
                 }
-                if e.flags & 1 != 0 {
-                    out[part2(e.person)].push(Se {
-                        person: e.person,
-                        ts: e.ts,
-                        price: e.price,
-                        cat: e.cat,
-                        purchase: e.flags & 2 != 0,
-                    });
+            }
+            const D: usize = 8;
+            let surv = &st.surv;
+            for i in 0..surv.len() {
+                if i + D < surv.len() {
+                    persons.prefetch(surv[i + D].uid);
                 }
-                i = j;
+                let e = surv[i];
+                let person = persons.get(e.uid);
+                st.out[parts.by_person(person)].push(Se {
+                    person,
+                    ts: ws + (e.tp >> 26) as i64,
+                    price: ((e.tp >> 2) & 0xff_ffff) as u32,
+                    cat: (e.meta & 0xffff) as u16,
+                    purchase: e.tp & 2 != 0,
+                });
             }
         },
     );
@@ -720,13 +1066,12 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let ncamp = ctx.camp_ids.len();
     let organic = ncamp as u16;
     let ncat = ctx.cat_names.len();
-    let mut order: Vec<(usize, usize)> = (0..P2)
-        .map(|q| (deduped.iter().map(|d| d[q].len()).sum::<usize>(), q))
-        .collect();
+    let mut order: Vec<(usize, usize)> =
+        (0..np).map(|q| (deduped.iter().map(|d| d.out[q].len()).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let aggs: Vec<AggState> = par_run(
         nt,
-        P2,
+        np,
         || AggState {
             rows: Vec::new(),
             camp: vec![0; (ncamp + 1) * ndays * 4],
@@ -735,37 +1080,18 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             ccount: vec![0; ncamp],
             cpos: vec![0; ncamp],
             active: Vec::new(),
+            g: Group::default(),
         },
         |st, oi| {
-            let q = order[oi].1;
-            let mut evs: Vec<Se> = Vec::with_capacity(order[oi].0);
-            for d in &deduped {
-                evs.extend_from_slice(&d[q]);
+            let (n, q) = order[oi];
+            let mut g = std::mem::take(&mut st.g);
+            group_partition(&mut g, n, deduped.iter().map(|d| d.out[q].as_slice()), parsed.iter().map(|s| s.ck[q].as_slice()));
+            for l in 0..g.off.len() - 1 {
+                let ev = &g.evs[g.off[l] as usize..g.off[l + 1] as usize];
+                let ck = &g.cks[g.coff[l] as usize..g.coff[l + 1] as usize];
+                person_sessions(st, ev[0].person, ev, ck, day0, ndays, organic);
             }
-            evs.sort_unstable_by_key(|e| (e.person, e.ts));
-            let mut cks: Vec<Ck> = Vec::new();
-            for s in &parsed {
-                cks.extend_from_slice(&s.ck[q]);
-            }
-            cks.sort_unstable_by_key(|c| (c.person, c.ts, c.cid));
-            let mut ci = 0;
-            let mut i = 0;
-            while i < evs.len() {
-                let person = evs[i].person;
-                let mut j = i + 1;
-                while j < evs.len() && evs[j].person == person {
-                    j += 1;
-                }
-                while ci < cks.len() && cks[ci].person < person {
-                    ci += 1;
-                }
-                let c0 = ci;
-                while ci < cks.len() && cks[ci].person == person {
-                    ci += 1;
-                }
-                person_sessions(st, person, &evs[i..j], &cks[c0..ci], day0, ndays, organic);
-                i = j;
-            }
+            st.g = g;
         },
     );
     tlog(t0, "sessions done");
@@ -1019,6 +1345,7 @@ fn main() {
         events: map_files(&list_csv(&data.join("events"))),
         clicks: map_files(&list_csv(&data.join("clicks"))),
         out_dir: out,
+        check_split: std::env::var_os("SS_CHECK_SPLIT").is_some(),
     };
     tlog(&t0, "inputs mapped");
 
@@ -1032,4 +1359,66 @@ fn main() {
         run(&ctx, &rp, &t0).expect("ranked run");
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn pack_padded_matches_pack() {
+        let p = Pack7 { fail: AtomicBool::new(false) };
+        let alphabet: &[u8] = b"\x00\x01\t ,\"azAZ09_\x7f\x80\xc3\xff";
+        let mut s = 0x1234_5678_9abc_def1u64;
+        for _ in 0..2_000_000 {
+            let n = (rng(&mut s) % 12) as usize;
+            let mut buf = [0u8; 32];
+            for b in buf.iter_mut() {
+                *b = alphabet[(rng(&mut s) % alphabet.len() as u64) as usize];
+            }
+            let f = &buf[..n];
+            p.fail.store(false, Relaxed);
+            let a = p.pack(f);
+            let fa = p.failed();
+            p.fail.store(false, Relaxed);
+            let b = unsafe { p.pack_padded(f) };
+            let fb = p.failed();
+            assert_eq!(fa, fb, "{f:?}");
+            if !fa {
+                assert_eq!(a, b, "{f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fast_fields_match_split() {
+        let alphabet: &[u8] = b"\"\",,,a1 \r\t\n";
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2_000_000 {
+            let n = (rng(&mut s) % 40) as usize;
+            let mut buf = [b'x'; 200];
+            for b in buf[..n].iter_mut() {
+                *b = alphabet[(rng(&mut s) % alphabet.len() as u64) as usize];
+            }
+            buf[n] = b'\n';
+            let (nl, cm, qm) = unsafe { scan::masks128(buf.as_ptr()) };
+            let len = nl.trailing_zeros() as usize;
+            let line = &buf[..len];
+            let mut a: [&[u8]; 4] = [b""; 4];
+            let mut b: [&[u8]; 4] = [b""; 4];
+            let oa = scan::fields::<4>(line, cm, qm, &mut a);
+            let ob = split::<4>(line, &mut b);
+            assert_eq!(oa, ob, "{line:?}");
+            if oa {
+                assert_eq!(a, b);
+            }
+        }
+    }
 }
