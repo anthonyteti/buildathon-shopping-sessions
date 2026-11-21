@@ -70,6 +70,23 @@ unsafe fn bump(size: usize) -> *mut u8 {
     (b + off) as *mut u8
 }
 
+/// Give the whole pages inside a dead arena block back to the OS (they are never reused).
+unsafe fn release(p: *mut u8, size: usize) {
+    if size < (1 << 20) {
+        return;
+    }
+    const PG: usize = 1 << 14; // covers 4 KiB and 16 KiB pages
+    let a = ((p as usize) + PG - 1) & !(PG - 1);
+    let b = ((p as usize) + size) & !(PG - 1);
+    if b > a {
+        #[cfg(target_os = "linux")]
+        let advice = libc::MADV_DONTNEED;
+        #[cfg(not(target_os = "linux"))]
+        let advice = libc::MADV_FREE;
+        unsafe { libc::madvise(a as *mut libc::c_void, b - a, advice) };
+    }
+}
+
 unsafe impl GlobalAlloc for Arena {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if l.size() >= BIG && l.align() <= ALIGN {
@@ -90,7 +107,9 @@ unsafe impl GlobalAlloc for Arena {
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if !in_arena(p) {
+        if in_arena(p) {
+            unsafe { release(p, l.size()) }
+        } else {
             unsafe { System.dealloc(p, l) }
         }
     }
