@@ -1228,6 +1228,10 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                 let mut n = 0usize;
                 let ck = &mut st.ck;
                 let flush = |pend: &[(u64, i64, u64, u16)], ck: &mut scatter::Scatter<Ck, 2>| {
+                    // filter words were prefetched on entry; now the table slots, then lookups
+                    for &(uid, _, _, _) in pend {
+                        pm.prefetch(uid);
+                    }
                     for &(uid, ts, cid, camp) in pend {
                         let person = pm.get(uid);
                         ck.push(parts.by_person(person), Ck { person, ts, cid, camp });
@@ -1246,7 +1250,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                     };
                     let cid = unsafe { pk.pack_padded(f[0]) };
                     let uid = unsafe { pk.pack_padded(f[1]) };
-                    pm.prefetch(uid);
+                    pm.prefetch_filter(uid);
                     pend[n] = (uid, ts, cid, camp);
                     n += 1;
                     if n == B {
