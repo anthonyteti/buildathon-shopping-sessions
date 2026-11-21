@@ -1030,6 +1030,9 @@ fn scan_lines<const N: usize>(file: &[u8], start: usize, end: usize, check: bool
     let mut out: [&[u8]; N] = [b""; N];
     while pos < end {
         if pos <= fast_end {
+            // keep the input stream ahead of the scan
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST));
+            prefetch(file.as_ptr().wrapping_add(pos + PF_DIST + 64));
             let (nl, cm, qm) = unsafe { scan::masks128(file.as_ptr().add(pos)) };
             if nl != 0 {
                 let len = nl.trailing_zeros() as usize;
@@ -1061,6 +1064,7 @@ fn scan_lines<const N: usize>(file: &[u8], start: usize, end: usize, check: bool
 }
 
 const INGEST_OFF: i64 = 1 << 47;
+const PF_DIST: usize = 1024;
 
 /// Returns None when the packer reports an ID it cannot represent.
 fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
