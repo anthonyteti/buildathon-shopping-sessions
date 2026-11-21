@@ -6,7 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-const BIG: usize = 64 << 10;
+const BIG: usize = 4 << 10;
 const RESERVE: usize = 1 << 37; // 128 GiB of address space, MAP_NORESERVE
 const ALIGN: usize = 64;
 /// Ask Linux for transparent huge pages on the arena.
