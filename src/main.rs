@@ -471,7 +471,12 @@ fn build_persons(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
     let total: usize = pairs.iter().map(|v| v.len()).sum();
     let mut uf = Uf::with_capacity(total + total / 2);
     for v in pairs {
-        for &(a, b) in v {
+        for (k, &(a, b)) in v.iter().enumerate() {
+            if k + 8 < v.len() {
+                let (a2, b2) = v[k + 8];
+                prefetch(uf.t.as_ptr().wrapping_add(mix(a2) as usize & uf.mask));
+                prefetch(uf.t.as_ptr().wrapping_add(mix(b2) as usize & uf.mask));
+            }
             let ia = uf.id(a);
             let ib = uf.id(b);
             let ra = uf.find(ia);
@@ -548,17 +553,38 @@ fn map_files(paths: &[PathBuf]) -> Vec<Input> {
 /// Runs `f(data, start, end)` over one chunk: either straight on the mapping, or (with
 /// `read`) on a copy read into `buf`, padded so every line takes the fast path.
 #[inline(always)]
-fn with_chunk(inp: &Input, c: &Chunk, read: bool, buf: &mut Vec<u8>, f: impl FnOnce(&[u8], usize, usize)) {
+fn with_chunk(inp: &Input, c: &Chunk, read: bool, buf: &mut Vec<u8>, mut f: impl FnMut(&[u8], usize, usize)) {
     if !read {
         f(&inp.map, c.start, c.end);
         return;
     }
+    // read the chunk in small blocks of whole lines into one reused buffer (stays in L2)
     use std::os::unix::fs::FileExt;
-    let len = c.end - c.start;
-    buf.clear();
-    buf.resize(len + scan::FAST_SLACK, 0);
-    inp.file.read_exact_at(&mut buf[..len], c.start as u64).expect("read csv");
-    f(&buf[..], 0, len);
+    const BLOCK: usize = 256 << 10;
+    let mut pos = c.start;
+    while pos < c.end {
+        let mut want = BLOCK.min(c.end - pos);
+        loop {
+            if buf.len() < want + scan::FAST_SLACK {
+                buf.resize(want + scan::FAST_SLACK, 0);
+            }
+            inp.file.read_exact_at(&mut buf[..want], pos as u64).expect("read csv");
+            if pos + want == c.end {
+                break;
+            }
+            match memchr::memrchr(b'\n', &buf[..want]) {
+                Some(i) => {
+                    want = i + 1;
+                    break;
+                }
+                None => want = (want * 2).min(c.end - pos),
+            }
+        }
+        // no stale bytes after the block (a last line without '\n' must not find one)
+        buf[want..want + scan::FAST_SLACK].fill(0);
+        f(&buf[..want + scan::FAST_SLACK], 0, want);
+        pos += want;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1259,7 +1285,14 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             let t = &mut st.table;
             // whole records in the table (it stays in L2): the kept copy per event_id
             for s in parsed.iter() {
-                for e in s.ev.vecs[p].iter() {
+                let v = &s.ev.vecs[p];
+                for (k, e) in v.iter().enumerate() {
+                    // prefetch the input stream and the table slot of a record a few ahead
+                    prefetch(v.as_ptr().wrapping_add(k + 16));
+                    if k + 8 < v.len() {
+                        let a = unsafe { v.get_unchecked(k + 8) }.eid;
+                        prefetch(t.as_ptr().wrapping_add(mix(a) as usize & mask));
+                    }
                     let mut i = (mix(e.eid) as usize) & mask;
                     loop {
                         let x = unsafe { t.get_unchecked_mut(i) };
