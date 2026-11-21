@@ -14,6 +14,7 @@
 //! equality and byte-wise order are exact integer operations. If any ID does not fit,
 //! the whole run is redone with keys that are ranks in the sorted set of all IDs.
 
+mod arena;
 mod fastpath;
 mod parquet_out;
 mod scan;
@@ -24,6 +25,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
+
+#[global_allocator]
+static GLOBAL: arena::Arena = arena::Arena;
 
 pub const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -334,13 +338,29 @@ fn prefetch<T>(p: *const T) {
 pub struct PersonMap {
     t: Vec<[u64; 2]>,
     mask: usize,
+    // one-hash filter (about 16 bits per entry): most IDs are their own person and
+    // are answered here without touching the big table
+    filt: Vec<u64>,
+    fshift: u32,
 }
 impl PersonMap {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        PersonMap { t: vec![[0, 0]; cap], mask: cap - 1 }
+        let fbits = (n * 16).next_power_of_two().max(4096);
+        PersonMap { t: vec![[0, 0]; cap], mask: cap - 1, filt: vec![0; fbits / 64], fshift: 64 - fbits.trailing_zeros() }
+    }
+    #[inline(always)]
+    fn fpos(&self, k: u64) -> usize {
+        (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> self.fshift) as usize
+    }
+    #[inline(always)]
+    fn maybe(&self, k: u64) -> bool {
+        let b = self.fpos(k);
+        unsafe { *self.filt.get_unchecked(b >> 6) >> (b & 63) & 1 != 0 }
     }
     fn insert(&mut self, k: u64, v: u64) {
+        let b = self.fpos(k);
+        self.filt[b >> 6] |= 1 << (b & 63);
         let mut i = mix(k) as usize & self.mask;
         loop {
             if self.t[i][0] == 0 || self.t[i][0] == k {
@@ -352,10 +372,15 @@ impl PersonMap {
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
-        prefetch(self.t.as_ptr().wrapping_add(mix(k) as usize & self.mask));
+        if self.maybe(k) {
+            prefetch(self.t.as_ptr().wrapping_add(mix(k) as usize & self.mask));
+        }
     }
     #[inline(always)]
     fn get(&self, k: u64) -> u64 {
+        if !self.maybe(k) {
+            return k;
+        }
         let mut i = mix(k) as usize & self.mask;
         loop {
             let s = unsafe { *self.t.get_unchecked(i) };
@@ -700,7 +725,8 @@ struct DedupState {
 
 struct AggState {
     rows: Vec<UdRow>,
-    camp: Vec<i64>, // [(camp) * ndays + day] * 4
+    camp: Vec<i64>, // [(camp) * ndays + day] * 4; slot 3 unused here (see asst)
+    asst: Vec<u32>, // assisted sessions per (camp) * ndays + day: small, stays in cache
     catsum: Vec<i64>,
     touched: Vec<u16>,
     ccount: Vec<u32>,
@@ -970,7 +996,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
             let c = items[i];
             if c.kind == 3 {
                 let _ = persons.set(build_persons(&pairs));
-                tlog(t0, "persons built");
+                tlog(t0, &format!("persons built ({} remapped IDs, table {} MB)", persons.get().unwrap().t.len() / 2, persons.get().unwrap().t.len() * 16 >> 20));
             } else if c.kind == 1 {
                 let mut buf = std::mem::take(&mut st.buf);
                 with_chunk(&ctx.events[c.file as usize], &c, ctx.use_read, &mut buf, |data, start, end| {
@@ -1148,6 +1174,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         || AggState {
             rows: Vec::new(),
             camp: vec![0; (ncamp + 1) * ndays * 4],
+            asst: vec![0; (ncamp + 1) * ndays],
             catsum: vec![0; ncat],
             touched: Vec::new(),
             ccount: vec![0; ncamp],
@@ -1174,6 +1201,9 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     for a in &aggs {
         for (x, y) in camp.iter_mut().zip(a.camp.iter()) {
             *x += *y;
+        }
+        for (i, &v) in a.asst.iter().enumerate() {
+            camp[i * 4 + 3] += v as i64;
         }
     }
     let ud_dir = ctx.out_dir.join("user_daily");
@@ -1277,7 +1307,7 @@ fn person_sessions(st: &mut AggState, person: u64, evs: &[Se], cks: &[Ck], day0:
                 j -= 1;
             }
             for &a in &st.active {
-                st.camp[cslot(a as usize, di, ndays) + 3] += 1;
+                st.asst[a as usize * ndays + di] += 1;
             }
             cks[j].camp
         } else {
