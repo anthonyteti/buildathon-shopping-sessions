@@ -9,7 +9,7 @@ A native implementation of the Buildathon "Shopping Sessions" track (Databricks)
 3. **Events and clicks.** Parse all chunks in parallel with the exact CSV dialect (every comma splits; quotes only around a whole field; `\r` is data; ASCII digits only). Each event copy carries its own validity (user, timestamp form and window, type, product, price, late check) and its person. Event copies are scattered by `hash(event_id)`; valid clicks, already resolved to their person, by `hash(person)`.
 4. **Dedup.** Per event-id partition: sort by `(event_id, ingest_ts)`, keep the earliest copy, and drop the event if that copy is invalid. Surviving events are scattered by `hash(person)`.
 5. **Sessions and attribution.** Per person partition (largest first): sort events by `(person, ts)` and clicks by `(person, ts, click_id)`. Walk each person's events into sessions (a gap over 30 minutes splits). A sliding 7-day window over the person's clicks gives the credited click (latest `ts`, then smallest `click_id`) and the set of assisting campaigns in time linear in clicks plus distinct campaigns per session. Rows are aggregated per (person, day) and per (campaign, day).
-6. **Output.** Each worker writes its own `user_daily` Parquet file (PLAIN, uncompressed); one file holds `campaign_daily`. Empty tables are still written with their typed schema.
+6. **Output.** A small built-in Parquet writer (one row group, PLAIN pages, Thrift compact metadata, no compression). Each worker writes its own `user_daily` file; one file holds `campaign_daily`. Empty tables are still written with their typed schema.
 
 **ID keys.** Every ID of 1 to 9 ASCII bytes is packed into a `u64` that keeps byte-wise order (7 bits per byte, big-endian, zero-padded), so equality, the smallest-ID person name and the `click_id` tie-break are plain integer comparisons. If any ID in the input does not fit (longer than 9 bytes, non-ASCII or NUL), the run is redone with keys that are ranks in the sorted set of all IDs, which is exact for any bytes. `SS_FORCE_RANK=1` forces that path for testing.
 
@@ -34,7 +34,8 @@ Beyond the fixtures and the dev answer, every change is checked against a plain-
 
 ## Open-source code used
 
-- Rust crates: [`memchr`](https://github.com/BurntSushi/memchr) (MIT/Unlicense), [`memmap2`](https://github.com/RazrFalcon/memmap2-rs) (MIT/Apache-2.0) and [`parquet`](https://github.com/apache/arrow-rs) (Apache-2.0), plus their transitive dependencies as listed in `Cargo.lock`.
+- Rust crates: [`memchr`](https://github.com/BurntSushi/memchr) (MIT/Unlicense), [`memmap2`](https://github.com/RazrFalcon/memmap2-rs) (MIT/Apache-2.0) and [`libc`](https://github.com/rust-lang/libc) (MIT/Apache-2.0), as listed in `Cargo.lock`.
+- The Parquet writer follows the Apache Parquet format specification; no Parquet library code is included.
 - `fixtures/` and `scripts/` (`run_fixtures.py`, `compare.py`, `docker_run.sh`) are copied unchanged from the track's starter repository.
 - Base image for the build stage: the official `rust` Docker image.
 

@@ -559,23 +559,19 @@ fn clean_field(f: &[u8]) -> &[u8] {
     f
 }
 
-fn read_two_col(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let data = std::fs::read(path).unwrap_or_default();
+/// Rows of a clean two-column CSV after its header (first row per key is kept by callers).
+fn two_col_rows(data: &[u8]) -> Vec<(&[u8], &[u8])> {
     let mut out = Vec::new();
-    let mut first = true;
-    for line in data.split(|&b| b == b'\n') {
-        if first {
-            first = false;
-            continue;
-        }
+    for line in data.split(|&b| b == b'\n').skip(1) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
-        let mut it = line.splitn(2, |&b| b == b',');
-        let a = clean_field(it.next().unwrap_or(b""));
-        let b = clean_field(it.next().unwrap_or(b""));
-        out.push((a.to_vec(), b.to_vec()));
+        let (a, b) = match memchr::memchr(b',', line) {
+            Some(i) => (&line[..i], &line[i + 1..]),
+            None => (line, &b""[..]),
+        };
+        out.push((clean_field(a), clean_field(b)));
     }
     out
 }
@@ -593,12 +589,8 @@ pub struct Ctx {
     nthreads: usize,
     ws: i64,
     we: i64,
-    #[allow(dead_code)]
-    products: FxMap<Vec<u8>, u16>,
     cat_names: Vec<Vec<u8>>,
     unknown_cat: u16,
-    #[allow(dead_code)]
-    campaigns: FxMap<Vec<u8>, u16>,
     camp_ids: Vec<Vec<u8>>,
     camp_channels: Vec<Vec<u8>>,
     links: Vec<Input>,
@@ -987,7 +979,7 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                         return;
                     }
                     let eid = unsafe { pk.pack_padded(f[0]) };
-                    let ingest = ctx.tstab.parse(f[3]).unwrap_or(i64::MAX);
+                    let ingest = ctx.tstab.ingest(f[3]);
                     let ing_s = (ingest.div_euclid(1000) - ws_s).clamp(-INGEST_OFF, INGEST_OFF - 1) + INGEST_OFF;
                     let mut rec = Ev { eid, uid: 0, meta: (ing_s as u64) << 16, tp: 0 };
                     'v: {
@@ -998,10 +990,17 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                             Some(t) if t >= ws && t < we => t,
                             _ => break 'v,
                         };
-                        let purchase = match f[4] {
-                            b"view" | b"cart" => false,
-                            b"purchase" => true,
-                            _ => break 'v,
+                        // event_type: compare whole words (fields have 16 readable bytes)
+                        let t = f[4];
+                        let w = u64::from_le(unsafe { (t.as_ptr() as *const u64).read_unaligned() });
+                        let purchase = if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") {
+                            true
+                        } else if t.len() == 4
+                            && ((w as u32) == u32::from_le_bytes(*b"view") || (w as u32) == u32::from_le_bytes(*b"cart"))
+                        {
+                            false
+                        } else {
+                            break 'v;
                         };
                         let mut price = 0u32;
                         if purchase {
@@ -1194,6 +1193,12 @@ fn run<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         });
     });
     tlog(t0, "output written");
+    if std::env::var_os("SS_DROP_TIMING").is_some() {
+        drop(aggs);
+        drop(deduped);
+        drop(parsed);
+        tlog(t0, "freed (timing only)");
+    }
     Some(())
 }
 
@@ -1479,40 +1484,40 @@ fn main() {
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
 
-    let prows = read_two_col(&data.join("products.csv"));
-    let mut cat_names: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
+    // products: category names sorted byte-wise (plus "unknown"), so a smaller index wins ties
+    let pdata = std::fs::read(data.join("products.csv")).unwrap_or_default();
+    let prows = two_col_rows(&pdata);
+    let mut cat_first: FxMap<&[u8], u16> = FxMap::default();
+    for &(_, c) in &prows {
+        let n = cat_first.len() as u16;
+        cat_first.entry(c).or_insert(n);
+    }
+    let mut cat_names: Vec<Vec<u8>> = cat_first.keys().map(|c| c.to_vec()).collect();
     cat_names.push(b"unknown".to_vec());
     cat_names.sort_unstable();
     cat_names.dedup();
-    let cat_idx: FxMap<Vec<u8>, u16> = cat_names.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
+    let cat_idx: FxMap<&[u8], u16> = cat_names.iter().enumerate().map(|(i, c)| (c.as_slice(), i as u16)).collect();
     let unknown_cat = cat_idx[&b"unknown"[..]];
-    let mut products: FxMap<Vec<u8>, u16> = FxMap::default();
-    for (p, c) in prows {
-        products.entry(p).or_insert(cat_idx[&c]);
-    }
-    let crows = read_two_col(&data.join("campaigns.csv"));
-    let mut campaigns: FxMap<Vec<u8>, u16> = FxMap::default();
+    let product_idx = fastpath::IdIndex::new(b"p", prows.iter().map(|&(p, c)| (p, cat_idx[c])));
+    let cdata = std::fs::read(data.join("campaigns.csv")).unwrap_or_default();
+    let mut seen: FxMap<&[u8], u16> = FxMap::default();
     let mut camp_ids = Vec::new();
     let mut camp_channels = Vec::new();
-    for (c, ch) in crows {
-        if campaigns.contains_key(&c) {
+    for (c, ch) in two_col_rows(&cdata) {
+        if seen.contains_key(c) {
             continue;
         }
-        campaigns.insert(c.clone(), camp_ids.len() as u16);
-        camp_ids.push(c);
-        camp_channels.push(ch);
+        seen.insert(c, camp_ids.len() as u16);
+        camp_ids.push(c.to_vec());
+        camp_channels.push(ch.to_vec());
     }
-
-    let product_idx = fastpath::IdIndex::new(b"p", &products);
-    let campaign_idx = fastpath::IdIndex::new(b"c_", &campaigns);
+    let campaign_idx = fastpath::IdIndex::new(b"c_", seen.iter().map(|(&c, &i)| (c, i)));
     let ctx = Ctx {
         nthreads,
         ws,
         we,
-        products,
         cat_names,
         unknown_cat,
-        campaigns,
         camp_ids,
         camp_channels,
         links: map_files(&list_csv(&data.join("links"))),
@@ -1599,6 +1604,11 @@ mod tests {
             }
             let f = &buf[..n];
             assert_eq!(tab.parse(f), parse_ts(f), "{:?}", String::from_utf8_lossy(f));
+            if n == 20 && f[19] == b'Z' {
+                if let Some(v) = parse_ts(f) {
+                    assert_eq!(tab.ingest(f), v, "{:?}", String::from_utf8_lossy(f));
+                }
+            }
         }
     }
 

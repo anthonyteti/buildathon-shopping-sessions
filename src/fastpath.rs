@@ -72,6 +72,30 @@ impl TsTab {
         Some((start + day - 1) * DAY + ((h * 60 + mi) * 60 + s) * 1000)
     }
 
+    /// ingest_ts, which the rules guarantee is a valid F1 timestamp: months near the
+    /// window are decoded without re-validating; anything else takes the full parse.
+    #[inline(always)]
+    pub fn ingest(&self, f: &[u8]) -> i64 {
+        if f.len() == 20 {
+            let a = u64::from_le_bytes(f[0..8].try_into().unwrap());
+            let mut j = usize::MAX;
+            for (k, &p) in self.prefix.iter().enumerate() {
+                if a == p {
+                    j = k;
+                }
+            }
+            if j != usize::MAX {
+                let day = (f[8].wrapping_sub(b'0') as i64) * 10 + f[9].wrapping_sub(b'0') as i64;
+                let t = u64::from_le_bytes(f[11..19].try_into().unwrap());
+                let v = t & 0x0F0F_0F0F_0F0F_0F0F;
+                let p = v * 10 + (v >> 8);
+                let (h, mi, s) = ((p & 0xFF) as i64, ((p >> 24) & 0xFF) as i64, ((p >> 48) & 0xFF) as i64);
+                return (self.months[j].0 + day - 1) * DAY + ((h * 60 + mi) * 60 + s) * 1000;
+            }
+        }
+        self.parse(f).unwrap_or(i64::MAX)
+    }
+
     /// Same result as `parse_ts`.
     #[inline(always)]
     pub fn parse(&self, f: &[u8]) -> Option<i64> {
@@ -146,25 +170,36 @@ pub struct IdIndex {
 }
 
 impl IdIndex {
-    pub fn new(prefix: &[u8], entries: &FxMap<Vec<u8>, u16>) -> IdIndex {
+    /// Entries are (id, index); the first entry for an id wins.
+    pub fn new<'a>(prefix: &[u8], entries: impl Iterator<Item = (&'a [u8], u16)> + Clone) -> IdIndex {
         let mut max_n = 0usize;
-        let mut ok = !entries.is_empty();
-        for k in entries.keys() {
+        let mut ok = true;
+        let mut any = false;
+        for (k, _) in entries.clone() {
+            any = true;
             match Self::number(prefix, k) {
                 Some(n) => max_n = max_n.max(n),
-                None => ok = false,
+                None => {
+                    ok = false;
+                    break;
+                }
             }
         }
-        let direct = if ok && max_n <= 10_000_000 {
+        if ok && any && max_n <= 10_000_000 {
             let mut v = vec![u16::MAX; max_n + 1];
-            for (k, &i) in entries {
-                v[Self::number(prefix, k).unwrap()] = i;
+            for (k, i) in entries {
+                let n = Self::number(prefix, k).unwrap();
+                if v[n] == u16::MAX {
+                    v[n] = i;
+                }
             }
-            Some(v)
-        } else {
-            None
-        };
-        IdIndex { prefix: prefix.to_vec(), direct, map: entries.clone() }
+            return IdIndex { prefix: prefix.to_vec(), direct: Some(v), map: FxMap::default() };
+        }
+        let mut map: FxMap<Vec<u8>, u16> = FxMap::default();
+        for (k, i) in entries {
+            map.entry(k.to_vec()).or_insert(i);
+        }
+        IdIndex { prefix: prefix.to_vec(), direct: None, map }
     }
 
     /// `<prefix>` then 1-8 ASCII digits without a leading zero.
