@@ -225,6 +225,14 @@ pub trait Packer: Sync {
 }
 
 /// Big-endian word of eight 7-bit bytes -> their 56 bits, most significant first.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn compress7(w: u64) -> u64 {
+    unsafe { std::arch::x86_64::_pext_u64(w, 0x7f7f_7f7f_7f7f_7f7f) }
+}
+
+/// Big-endian word of eight 7-bit bytes -> their 56 bits, most significant first.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
 #[inline(always)]
 fn compress7(w: u64) -> u64 {
     let x = (w & 0x007f_007f_007f_007f) | ((w & 0x7f00_7f00_7f00_7f00) >> 1);

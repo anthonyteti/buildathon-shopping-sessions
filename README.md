@@ -11,6 +11,8 @@ A native implementation of the Buildathon "Shopping Sessions" track (Databricks)
 5. **Sessions and attribution.** Per person partition (largest first): sort events by `(person, ts)` and clicks by `(person, ts, click_id)`. Walk each person's events into sessions (a gap over 30 minutes splits). A sliding 7-day window over the person's clicks gives the credited click (latest `ts`, then smallest `click_id`) and the set of assisting campaigns in time linear in clicks plus distinct campaigns per session. Rows are aggregated per (person, day) and per (campaign, day).
 6. **Output.** A small built-in Parquet writer (one row group, PLAIN pages, Thrift compact metadata, no compression). Each worker writes its own `user_daily` file; one file holds `campaign_daily`. Empty tables are still written with their typed schema.
 
+**Memory.** Large buffers are bump-allocated from one reserved region that asks Linux for transparent huge pages; they are never reused, and the process exits right after writing the output.
+
 **ID keys.** Every ID of 1 to 9 ASCII bytes is packed into a `u64` that keeps byte-wise order (7 bits per byte, big-endian, zero-padded), so equality, the smallest-ID person name and the `click_id` tie-break are plain integer comparisons. If any ID in the input does not fit (longer than 9 bytes, non-ASCII or NUL), the run is redone with keys that are ranks in the sorted set of all IDs, which is exact for any bytes. `SS_FORCE_RANK=1` forces that path for testing.
 
 ## Build and run
