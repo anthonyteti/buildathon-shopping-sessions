@@ -522,9 +522,9 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let (ke, ku, kc) = (keys.e, keys.u, keys.c);
     tlog(t0, "keys recovered");
 
-    // ---- links: on their own phase (SS_LINKS_PAR=1), or by one worker while the others
-    // parse events and clicks (nothing in the parse needs persons)
-    let links_par = std::env::var_os("SS_LINKS_PAR").is_some();
+    // ---- links: on their own phase, or (SS_LINKS_OVERLAP=1) by one worker while the
+    // others parse events and clicks (nothing in the parse needs persons)
+    let links_par = std::env::var_os("SS_LINKS_OVERLAP").is_none();
     let links_cell: std::sync::OnceLock<Option<(CMap, Vec<Ul>)>> = std::sync::OnceLock::new();
     if links_par {
         let _ = links_cell.set(build_links(ctx, pk, ku, check, nt));
@@ -538,8 +538,8 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     let est_ck = (ck_bytes as f64 / keys.ck_line.max(8.0)) as u64;
     let le = Layout::new(est_ev + est_ev / 4 + 4096)?;
     let lc = Layout::new(est_ck + est_ck / 4 + 4096)?;
-    let er_res = (est_ev as usize) * 11 / 10 / (nt * le.np) + 8;
-    let cr_res = (est_ck as usize) * 11 / 10 / (nt * lc.np) + 8;
+    let er_res = (est_ev as usize) * 13 / 10 / (nt * le.np) + 8;
+    let cr_res = (est_ck as usize) * 13 / 10 / (nt * lc.np) + 8;
     let mut items = Vec::new();
     make_chunks(&ctx.events, 1, 8 << 20, &mut items);
     let mut ckc = Vec::new();
@@ -556,7 +556,7 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         || DState {
             tid: next_tid.fetch_add(1, Relaxed) as u32,
             er: scatter::Scatter::new(le.np, er_res),
-            pr: scatter::Scatter::new(le.np, er_res / 16 + 8),
+            pr: scatter::Scatter::new(le.np.div_ceil(16), er_res + 8),
             cr: scatter::Scatter::new(lc.np, cr_res),
             xe: Vec::new(),
             xc: Vec::new(),
@@ -648,7 +648,10 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
                     }
                 }
                 for s in parsed.iter() {
-                    for r in &s.pr.vecs[p] {
+                    for r in &s.pr.vecs[p >> 4] {
+                        if (r.w0 >> 16) & 15 != (p & 15) as u64 {
+                            continue;
+                        }
                         let x = unsafe { loc.get_unchecked_mut((r.w0 & 0xffff) as usize) };
                         if x.w0 != 0 && (x.w1 >> 16) & 7 == 3 && x.w0 >> 32 == r.w0 >> 32 {
                             x.w0 = (x.w0 & 0xffff_ffff) | (r.w1 << 32);
@@ -923,6 +926,9 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
         p2.iter().flat_map(|x| x.1.sp_c.iter()).map(|v| v.len()).sum::<usize>(),
         slow_u.iter().map(|w| w.count_ones() as usize).sum::<usize>()));
 
+    // the slow path adds to pass 2's aggregation states (one output file per thread)
+    let (p2_aggs, p2_work): (Vec<AggState>, Vec<Pass2>) = p2.into_iter().unzip();
+    let pool = std::sync::Mutex::new(p2_aggs);
     // ---- slow path: everything else, grouped by person name. Pass 2 already split its
     // records by person partition; the few from placement and the exotic IDs join here.
     let mut sp0_e: Vec<Vec<Se>> = (0..NSP).map(|_| Vec::new()).collect();
@@ -937,17 +943,17 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     }
     let sp0_e = &sp0_e;
     let sp0_c = &sp0_c;
-    let p2r = &p2;
+    let p2r = &p2_work;
     let part_e = move |q: usize| {
-        p2r.iter().map(move |x| x.1.sp_e.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_e[q].as_slice()))
+        p2r.iter().map(move |x| x.sp_e.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_e[q].as_slice()))
     };
     let part_c = move |q: usize| {
-        p2r.iter().map(move |x| x.1.sp_c.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_c[q].as_slice()))
+        p2r.iter().map(move |x| x.sp_c.get(q).map_or(&[][..], |v| v.as_slice())).chain(std::iter::once(sp0_c[q].as_slice()))
     };
     let mut sorder: Vec<(usize, usize)> = (0..NSP).map(|q| (part_e(q).map(|s| s.len()).sum::<usize>(), q)).collect();
     sorder.sort_unstable_by(|a, b| b.cmp(a));
     let sorder = &sorder;
-    let slow_aggs: Vec<AggState> = par_run(nt, NSP, new_agg, |st, k| {
+    let aggs: Vec<AggState> = par_run(nt, NSP, || pool.lock().unwrap().pop().unwrap_or_else(new_agg), |st, k| {
         let (n, q) = sorder[k];
         if n == 0 {
             return;
@@ -963,8 +969,9 @@ pub fn run_dense<P: Packer>(ctx: &Ctx, pk: &P, t0: &Instant) -> Option<()> {
     });
     tlog(t0, "sessions done (slow path)");
 
-    let mut aggs: Vec<AggState> = p2.into_iter().map(|x| x.0).collect();
-    aggs.extend(slow_aggs);
+    let mut aggs = aggs;
+    aggs.extend(pool.into_inner().unwrap());
+    drop(p2_work);
     write_output(ctx, pk, &aggs, ndays, day0);
     tlog(t0, "output written");
     Some(())
@@ -1404,7 +1411,7 @@ impl<'a, P: Packer> Sink<7> for EvSink<'a, P> {
                     },
                 );
                 if valid && purchase {
-                    st.pr.push(part, R { w0: (ingb as u64) << 32 | local, w1: price as u64 | (cat as u64) << 24 });
+                    st.pr.push(part >> 4, R { w0: (ingb as u64) << 32 | ((part & 15) as u64) << 16 | local, w1: price as u64 | (cat as u64) << 24 });
                 }
             }
             _ => {
